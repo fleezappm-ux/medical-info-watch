@@ -1,0 +1,71 @@
+:root {
+  color-scheme: light;
+
+  /* --- カラートークン --- */
+  --paper: #eef0ee;
+  --paper-raised: #ffffff;
+  --ink: #1a2229;
+  --ink-soft: #4b5560;
+  --ink-faint: #7c8790;
+  --line: #d7dbd6;
+  --line-strong: #b9bfb9;
+
+  --brand: #28415c;
+  --brand-soft: #e4e9ee;
+
+  --signal-critical: #a83c1e;
+  --signal-critical-soft: #f6e6df;
+  --signal-caution: #93630f;
+  --signal-caution-soft: #f3ecd9;
+  --signal-info: #3d6e63;
+  --signal-info-soft: #e2ede9;
+  --signal-neutral: #6b7280;
+  --signal-neutral-soft: #eceeec;
+
+  /* --- タイポグラフィ --- */
+  --font-display: 'Shippori Mincho', serif;
+  --font-body: 'Zen Kaku Gothic New', 'Hiragino Sans', sans-serif;
+
+  --radius-sm: 3px;
+  --radius-md: 6px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.7;
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font-family: inherit;
+}
+
+a {
+  color: var(--brand);
+}
+
+:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}
