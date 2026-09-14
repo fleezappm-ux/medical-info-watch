@@ -37,6 +37,15 @@ export function needsReview(item: InformationItem): boolean {
   return item.reviewStatus === 'unreviewed' || item.reviewStatus === 'reviewing'
 }
 
+/**
+ * 「変更あり」タブ用：今回の取得で実際に内容変化・供給再開・掲載未確認が検知されたもの。
+ * 'new'（初出）はここには含めない（変更ではなく初登場のため）。
+ * これはinformation_item_historyに履歴が記録される条件（isFirstTimeEvent）と一致する。
+ */
+export function hasContentChanged(item: InformationItem): boolean {
+  return item.changeStatus === 'updated' || item.changeStatus === 'resolved' || item.changeStatus === 'missing'
+}
+
 /** 内容変更・供給再開などが検知され、HOME表示中でも再確認が必要な状態かどうか。 */
 export function needsHomeDisplayReview(item: InformationItem): boolean {
   return Boolean(item.homeDisplayNeedsReview)

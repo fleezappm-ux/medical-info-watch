@@ -7,6 +7,7 @@ import {
   isSameLocalDay,
   needsHomeDisplayReview,
   changeStatusLabel,
+  hasContentChanged,
 } from './review'
 import type { InformationItem } from '../types'
 
@@ -122,5 +123,19 @@ describe('changeStatusLabel', () => {
     expect(changeStatusLabel(makeItem({ changeStatus: 'missing', missingStreak: 3 }))).toBe(
       '掲載未確認・要手動確認（3回連続）',
     )
+  })
+})
+
+describe('hasContentChanged（「変更あり」タブの絞り込み条件）', () => {
+  it('updated・resolved・missingはtrue', () => {
+    expect(hasContentChanged(makeItem({ changeStatus: 'updated' }))).toBe(true)
+    expect(hasContentChanged(makeItem({ changeStatus: 'resolved' }))).toBe(true)
+    expect(hasContentChanged(makeItem({ changeStatus: 'missing' }))).toBe(true)
+  })
+
+  it('new・unchanged・未設定はfalse（新規は「変更」ではなく初出のため含めない）', () => {
+    expect(hasContentChanged(makeItem({ changeStatus: 'new' }))).toBe(false)
+    expect(hasContentChanged(makeItem({ changeStatus: 'unchanged' }))).toBe(false)
+    expect(hasContentChanged(makeItem({}))).toBe(false)
   })
 })

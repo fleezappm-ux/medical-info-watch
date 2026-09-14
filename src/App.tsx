@@ -10,7 +10,7 @@ import { mockItems } from './data/mockItems'
 import { mockWatchSettings } from './data/mockWatchSettings'
 import type { ImportanceLevel, SourceStatus, WatchLevel } from './types'
 import { fetchInformationItemsFromApi, fetchHistoryForItem, postUpdateToApi } from './lib/api'
-import { canMarkReviewed, canConfirmImportance, canConfirmHomeDisplay, isConfirmedImportant, needsReview, hasFetchError } from './lib/review'
+import { canMarkReviewed, canConfirmImportance, canConfirmHomeDisplay, isConfirmedImportant, needsReview, hasContentChanged, hasFetchError } from './lib/review'
 
 type View = 'list' | 'settings'
 
@@ -47,6 +47,7 @@ function App() {
     () => ({
       all: items.length,
       unreviewed: items.filter(needsReview).length,
+      changed: items.filter(hasContentChanged).length,
       important: items.filter(isConfirmedImportant).length,
       error: items.filter(hasFetchError).length,
     }),

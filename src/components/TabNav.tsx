@@ -1,4 +1,4 @@
-export type ListTab = 'all' | 'unreviewed' | 'important' | 'error'
+export type ListTab = 'all' | 'unreviewed' | 'changed' | 'important' | 'error'
 
 interface Props {
   active: ListTab
@@ -9,6 +9,7 @@ interface Props {
 const tabs: { key: ListTab; label: string }[] = [
   { key: 'all', label: '全件一覧' },
   { key: 'unreviewed', label: '要確認' },
+  { key: 'changed', label: '変更あり' },
   { key: 'important', label: '重要情報（確定）' },
   { key: 'error', label: '取得エラー' },
 ]
