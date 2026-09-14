@@ -9,7 +9,7 @@ import { SourceStatusPanel } from './components/SourceStatusPanel'
 import { mockItems } from './data/mockItems'
 import { mockWatchSettings } from './data/mockWatchSettings'
 import type { ImportanceLevel, SourceStatus, WatchLevel } from './types'
-import { fetchInformationItemsFromApi, postUpdateToApi } from './lib/api'
+import { fetchInformationItemsFromApi, fetchHistoryForItem, postUpdateToApi } from './lib/api'
 import { canMarkReviewed, canConfirmImportance, canConfirmHomeDisplay, isConfirmedImportant, needsReview, hasFetchError } from './lib/review'
 
 type View = 'list' | 'settings'
@@ -248,6 +248,7 @@ function App() {
             onMarkReviewed={handleMarkReviewed}
             onConfirmImportance={handleConfirmImportance}
             onSetHomeDisplay={handleSetHomeDisplay}
+            onLoadHistory={isRealData && apiUrl.trim() ? (id: string) => fetchHistoryForItem(apiUrl.trim(), id) : null}
           />
         )}
       </main>

@@ -85,6 +85,14 @@ export interface SourceStatus {
   errorMessage: string | null
 }
 
+/** information_item_historyシートに記録された、1件の変更イベント（新しい順で表示する）。 */
+export interface HistoryEntry {
+  detectedAt: string
+  previousSummary: string | null
+  newSummary: string
+  diffNote: string | null
+}
+
 export type WatchLevel = 'off' | 'watch' | 'home'
 
 export interface WatchSetting {

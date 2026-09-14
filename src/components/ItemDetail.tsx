@@ -1,4 +1,5 @@
-import type { ImportanceLevel, InformationItem } from '../types'
+import { useEffect, useState } from 'react'
+import type { HistoryEntry, ImportanceLevel, InformationItem } from '../types'
 import { ImportanceBadge } from './ImportanceBadge'
 import { categoryLabel, formatDate, importanceLabel } from '../lib/importance'
 import { canMarkReviewed, canConfirmHomeDisplay, changeStatusLabel, needsHomeDisplayReview } from '../lib/review'
@@ -9,6 +10,8 @@ interface Props {
   onMarkReviewed: (id: string) => void
   onConfirmImportance: (id: string, level: ImportanceLevel) => void
   onSetHomeDisplay: (id: string, enabled: boolean) => void
+  /** 実データ連携中のみ渡される。nullの場合（モック表示中）は変更履歴セクション自体を出さない。 */
+  onLoadHistory: ((itemId: string) => Promise<HistoryEntry[]>) | null
 }
 
 const reviewStatusLabel: Record<InformationItem['reviewStatus'], string> = {
@@ -26,6 +29,7 @@ export function ItemDetail({
   onMarkReviewed,
   onConfirmImportance,
   onSetHomeDisplay,
+  onLoadHistory,
 }: Props) {
   const primaryLinks = item.links.filter((l) => l.kind === 'primary')
   const relatedLinks = item.links.filter((l) => l.kind === 'related')
@@ -33,6 +37,39 @@ export function ItemDetail({
   const isExcluded = item.reviewStatus === 'excluded'
   const changeLabel = changeStatusLabel(item)
   const homeReviewNeeded = needsHomeDisplayReview(item)
+
+  const [historyStatus, setHistoryStatus] = useState<'idle' | 'loading' | 'ok' | 'error'>('idle')
+  const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([])
+  const [historyError, setHistoryError] = useState('')
+
+  // アイテムを切り替えるたびに履歴を読み直す。onLoadHistoryが無い（モック表示中）場合は何もしない
+  // （履歴セクション自体をJSX側で出さないため、状態をリセットする必要もない）。
+  useEffect(() => {
+    if (!onLoadHistory) return
+    let cancelled = false
+
+    async function load() {
+      setHistoryStatus('loading')
+      setHistoryError('')
+      try {
+        const entries = await onLoadHistory!(item.id)
+        if (cancelled) return
+        setHistoryEntries(entries)
+        setHistoryStatus('ok')
+      } catch (err) {
+        if (cancelled) return
+        setHistoryError(err instanceof Error ? err.message : '不明なエラーが発生しました')
+        setHistoryStatus('error')
+      }
+    }
+
+    load()
+    return () => {
+      cancelled = true
+    }
+    // itemが変わった時・onLoadHistoryの有無が変わった時にだけ読み直せばよい
+    // eslint-disable-next-line
+  }, [item.id, onLoadHistory])
 
   return (
     <article className="item-detail">
@@ -144,6 +181,37 @@ export function ItemDetail({
           )}
         </section>
       </div>
+
+      {onLoadHistory && (
+        <section className="item-detail-panel item-detail-history">
+          <h3>変更履歴</h3>
+          {historyStatus === 'loading' && <p className="empty-state">読み込み中…</p>}
+          {historyStatus === 'error' && <p className="fetch-error-notice">履歴の取得に失敗しました：{historyError}</p>}
+          {historyStatus === 'ok' && historyEntries.length === 0 && (
+            <p className="empty-state">この情報はまだ内容変更が検知されていません。</p>
+          )}
+          {historyStatus === 'ok' && historyEntries.length > 0 && (
+            <ul className="history-list">
+              {historyEntries.map((h, idx) => (
+                <li key={`${h.detectedAt}-${idx}`} className="history-entry">
+                  <p className="history-entry-date">{formatDate(h.detectedAt.slice(0, 10))}</p>
+                  <p className="history-entry-summary">
+                    <span className="history-entry-label">変更後：</span>
+                    {h.newSummary}
+                  </p>
+                  {h.previousSummary && (
+                    <p className="history-entry-summary history-entry-previous">
+                      <span className="history-entry-label">変更前：</span>
+                      {h.previousSummary}
+                    </p>
+                  )}
+                  {h.diffNote && <p className="history-entry-note">{h.diffNote}</p>}
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
 
       {isExcluded ? (
         <p className="item-detail-actions-note item-detail-excluded-note">

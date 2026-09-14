@@ -1,4 +1,4 @@
-import type { InformationItem, SourceStatus, WatchSetting } from '../types'
+import type { HistoryEntry, InformationItem, SourceStatus, WatchSetting } from '../types'
 
 interface ApiResponse {
   items?: InformationItem[]
@@ -31,6 +31,23 @@ export async function fetchInformationItemsFromApi(apiUrl: string): Promise<Fetc
     watchSettings: data.watchSettings ?? null,
     sourceStatuses: data.sourceStatuses ?? null,
   }
+}
+
+/**
+ * 指定した情報アイテムの変更履歴（新しい順）を取得する。
+ * GASのdoGetに?action=history&itemId=...を付けて呼ぶ（読み込み専用の別クエリ）。
+ */
+export async function fetchHistoryForItem(apiUrl: string, itemId: string): Promise<HistoryEntry[]> {
+  const url = `${apiUrl}${apiUrl.includes('?') ? '&' : '?'}action=history&itemId=${encodeURIComponent(itemId)}`
+  const res = await fetch(url)
+  if (!res.ok) {
+    throw new Error(`履歴の取得に失敗しました（HTTP ${res.status}）`)
+  }
+  const data = (await res.json()) as { history?: HistoryEntry[]; error?: string }
+  if (data.error) {
+    throw new Error(data.error)
+  }
+  return data.history ?? []
 }
 
 /**

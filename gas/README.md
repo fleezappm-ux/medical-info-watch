@@ -9,8 +9,9 @@ v3からの変更点（2次監査対応）は本ファイル末尾の「v3→v3.
 ### PMDA回収情報
 
 - `https://www.info.pmda.go.jp/kaisyuu/rcidx{年度2桁}-{クラス}{区分}.csv`
-- 現在は**クラスI（医薬品等）のみ**。年度は実行時点の日付から自動算出する（`currentJapaneseFiscalYear2Digit_`）ため、年度が変わってもコード修正は不要。
-- クラスII・IIIは今後の拡張対象。`pmdaFiscalYearCandidates_` にクラスの配列を増やせば対応できる構造にしてある。
+- クラスI・II・III（医薬品等）を取得。年度は実行時点の日付から自動算出する（`currentJapaneseFiscalYear2Digit_`）ため、年度が変わってもコード修正は不要。
+- クラスごとに独立した情報源（`pmda_recall_class1`/`pmda_recall_class2`/`pmda_recall_class3`、`PMDA_RECALL_CLASSES_`で定義）として取得・成功失敗判定・変更検知を行う。1クラスのCSVが一時的に取得できなくても、他クラスの更新・既存データには影響しない（`source_run_logs`にもクラスごとに記録される）。
+- 対象を医療機器等（区分`k`）にも広げる場合は`PMDA_RECALL_CLASSES_`と取得URLの区分文字を見直す必要がある（現在は医薬品等`m`区分のみ）。
 
 ### 厚生労働省 医療用医薬品供給状況
 
@@ -129,8 +130,14 @@ PMDA CSV・厚労省Excelから取得した文字列のうち、先頭が `=` `+
 5. ハッシュ関数を軽量ハッシュ(cyrb53)からSHA-256（純粋JS実装）に変更した
 6. `information_items` / `source_run_logs` の見出し行を実行のたびに自動的に書き直すようにした（列追加時に見出しが古いまま残らないように）
 
+## v3.1→v3.2の変更点
+
+1. PMDA回収情報をクラスII・IIIにも拡大。クラスI・II・IIIをそれぞれ独立した情報源（`pmda_recall_class1/2/3`）として扱い、1クラスの取得失敗が他クラスに影響しないようにした
+2. idの生成方式を`sourceId + 回収番号`に変更（旧`pmda_recall_ + 回収番号`）。クラスをまたいで回収番号が重複してもinformation_itemsシート全体でidが一意になるようにするため
+3. 画面表示用に、情報源名（sourceName）へクラス名（クラスI/II/III）を含めるようにした（`extractRecallClassLabel_`）
+4. `doGet`に`?action=history&itemId=...`クエリを追加し、`information_item_history`から指定アイテムの変更履歴（新しい順・最大50件）を返せるようにした（`getHistoryForItem_` / `filterAndFormatHistoryRows_`）。アプリの詳細画面に「変更履歴」セクションを追加し、この新しいクエリを使って表示している
+
 ## 次のステップ
 
-1. クラスII・III、医療機器等への対象拡大
+1. 医療機器等（区分`k`）への対象拡大
 2. 認証基盤の検討（本番運用前の必須課題）
-3. `information_item_history` を使った変更履歴のUI表示（現状はスプレッドシート上でのみ閲覧可能）

@@ -1,6 +1,15 @@
 /**
- * 医療情報ウォッチ GAS本体（v3）
+ * 医療情報ウォッチ GAS本体（v3.2）
  * ------------------------------------------------------------
+ * v3.1からの変更点（PMDA回収情報のクラスII・III拡大、変更履歴のAPI公開）：
+ *   ・クラスI・II・IIIをそれぞれ独立した情報源（pmda_recall_class1/2/3）として取得。
+ *     1クラスのCSV取得失敗が他クラスの更新・既存データに影響しないよう分離した
+ *   ・idの生成方式を sourceId + 回収番号 に変更し、クラスをまたいだid衝突を防止
+ *   ・情報源名（sourceName）にクラス名を含めて画面上で区別できるようにした
+ *   ・doGetに ?action=history&itemId=... を追加し、information_item_historyから
+ *     指定アイテムの変更履歴（新しい順・最大50件）を返せるようにした
+ *   詳細はgas/README.mdの「v3.1→v3.2の変更点」を参照。
+ *
  * v2からの主な変更点（2026-09-14 監査対応）：
  *   1. 情報源ごとに成功/失敗を分けて扱い、失敗した情報源の既存データは一切触らない
  *   2. 「情報アイテム変換結果」シートの全削除→作り直しをやめ、`information_items`
@@ -305,20 +314,31 @@ function currentJapaneseFiscalYear2Digit_(date) {
 }
 
 /**
- * PMDA回収情報CSVの取得候補（年度・クラス）を返す。
- * 現在はクラスIのみ（クラスII・IIIは今後の拡張対象。gas/README.md参照）。
+ * PMDA回収情報CSVの取得候補（年度）を、指定したクラス（1/2/3）について返す。
+ * v3.2でクラスII・IIIにも対応（クラスごとに別の情報源として扱う。下のPMDA_RECALL_CLASSES_参照）。
  * 年度は日付から自動算出するため、年度が変わってもコード修正は不要。
  */
-function pmdaFiscalYearCandidates_(date) {
+function pmdaFiscalYearCandidatesForClass_(date, recallClass) {
   var currentFy = currentJapaneseFiscalYear2Digit_(date);
   var currentFyNum = parseInt(currentFy, 10);
   var previousFyNum = currentFyNum - 1;
   var previousFy = previousFyNum < 0 ? '99' : previousFyNum < 10 ? '0' + previousFyNum : String(previousFyNum);
   return [
-    { fiscalYear2Digit: currentFy, recallClass: 1 },
-    { fiscalYear2Digit: previousFy, recallClass: 1 },
+    { fiscalYear2Digit: currentFy, recallClass: recallClass },
+    { fiscalYear2Digit: previousFy, recallClass: recallClass },
   ];
 }
+
+/**
+ * PMDA回収情報として取り込むクラスの一覧。クラスごとに独立した情報源（sourceId）として扱い、
+ * source_run_logsでも別々に成功/失敗を記録する。これにより、例えばクラスIIIのCSVが
+ * 一時的に取得できなくても、クラスI・IIの取得・変更検知には影響しない。
+ */
+var PMDA_RECALL_CLASSES_ = [
+  { recallClass: 1, sourceId: 'pmda_recall_class1' },
+  { recallClass: 2, sourceId: 'pmda_recall_class2' },
+  { recallClass: 3, sourceId: 'pmda_recall_class3' },
+];
 
 // ---- CSVの列見出し（この順番で並んでいる） ----
 
@@ -360,6 +380,18 @@ function mapRecallClassToImportance_(recallClassLabel) {
   return 'info'; // 判定不能
 }
 
+/**
+ * CSVの「クラス分類」列から、画面表示用の短いクラス名（'クラスI'/'クラスII'/'クラスIII'）を取り出す。
+ * mapRecallClassToImportance_と同じ理由で、判定順序は III → II → I。
+ */
+function extractRecallClassLabel_(recallClassLabel) {
+  var label = recallClassLabel || '';
+  if (label.indexOf('クラスIII') !== -1) return 'クラスIII';
+  if (label.indexOf('クラスII') !== -1) return 'クラスII';
+  if (label.indexOf('クラスI') !== -1) return 'クラスI';
+  return 'クラス不明';
+}
+
 // CSVの「掲載年月日」列（例："'2026/06/26"）→ "2026-06-26" 形式
 function normalizePublishedAt_(rawDate) {
   var cleaned = String(rawDate || '').replace(/^'/, '').trim();
@@ -375,8 +407,12 @@ function normalizePublishedAt_(rawDate) {
  * CSVの1行（配列）を、information_items用の「今回取得した内容」オブジェクトへ変換する。
  * 人間の確認状態（reviewStatus等）はここでは持たせない。それは
  * mergeSourceItems_ が既存データとの比較結果から決める。
+ *
+ * idにsourceIdを含めるのは、クラスI・II・IIIを別々の情報源として扱うようになったv3.2以降、
+ * 回収番号がクラスをまたいで重複した場合でもinformation_itemsシート全体でidが
+ * ユニークであることを保証するため（sourceRecordIdは回収番号そのものを保持する）。
  */
-function buildPmdaRecallItem_(row, listPageUrl, fetchedAtIso) {
+function buildPmdaRecallItem_(row, listPageUrl, fetchedAtIso, sourceId) {
   var recallNumber = row[0];
   var publishedAtRaw = row[1];
   var itemKind = row[2];
@@ -417,7 +453,7 @@ function buildPmdaRecallItem_(row, listPageUrl, fetchedAtIso) {
   );
 
   return {
-    id: 'pmda_recall_' + recallNumber,
+    id: sourceId + '_' + recallNumber,
     sourceRecordId: String(recallNumber),
     category: 'pharmacy',
     itemType: '回収',
@@ -425,7 +461,7 @@ function buildPmdaRecallItem_(row, listPageUrl, fetchedAtIso) {
     summary: sanitizeCellValue_(reason.trim()),
     aiImportance: importance,
     publishedAt: publishedAt,
-    sourceName: sanitizeCellValue_('PMDA（' + itemKind + '）'),
+    sourceName: sanitizeCellValue_('PMDA（' + itemKind + '・' + extractRecallClassLabel_(recallClassLabel) + '）'),
     documentNumber: sanitizeCellValue_('回収番号：' + recallNumber),
     pharmacyImpact: sanitizeCellValue_(
       healthRisk.trim() + (manufacturer ? '\n\n【製造販売業者】\n' + manufacturer.trim() : ''),
@@ -440,9 +476,9 @@ function buildPmdaRecallItem_(row, listPageUrl, fetchedAtIso) {
 }
 
 /** CSVの全行を、information_items用オブジェクトの配列に変換する（純粋関数）。 */
-function buildPmdaIncomingItems_(rows, listPageUrl, fetchedAtIso) {
+function buildPmdaIncomingItems_(rows, listPageUrl, fetchedAtIso, sourceId) {
   return rows.map(function (row) {
-    return buildPmdaRecallItem_(row, listPageUrl, fetchedAtIso);
+    return buildPmdaRecallItem_(row, listPageUrl, fetchedAtIso, sourceId);
   });
 }
 
@@ -982,7 +1018,12 @@ var RUN_LOG_HEADER_ = [
   'errorMessage',
 ];
 
-var SOURCE_LABELS_ = { pmda_recall: 'PMDA回収情報', mhlw_supply: '厚労省供給情報' };
+var SOURCE_LABELS_ = {
+  pmda_recall_class1: 'PMDA回収情報（クラスI）',
+  pmda_recall_class2: 'PMDA回収情報（クラスII）',
+  pmda_recall_class3: 'PMDA回収情報（クラスIII）',
+  mhlw_supply: '厚労省供給情報',
+};
 
 // 旧バージョン（v2）が使っていた「情報アイテム変換結果」シート関連
 var LEGACY_SHEET_NAME_ = '情報アイテム変換結果';
@@ -1206,6 +1247,42 @@ function appendHistoryEntries_(entries) {
   sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, HISTORY_HEADER_.length).setValues(rows);
 }
 
+/**
+ * information_item_historyシートの全行（配列の配列、HISTORY_HEADER_の並び）から、
+ * 指定したitemIdの履歴だけを抜き出し、新しい順（detectedAt降順）に並べ、
+ * 画面表示用のオブジェクト配列にする（純粋関数）。
+ * ハッシュ値（previousHash/newHash）はデバッグ用の内部情報のため画面には出さない。
+ */
+function filterAndFormatHistoryRows_(rows, itemId) {
+  var matched = rows.filter(function (row) {
+    return row[0] === itemId;
+  });
+  matched.sort(function (a, b) {
+    var aTime = new Date(a[2]).getTime();
+    var bTime = new Date(b[2]).getTime();
+    return bTime - aTime;
+  });
+  return matched.map(function (row) {
+    return {
+      detectedAt: normalizeFetchedAtValue_(row[2]),
+      previousSummary: row[5] || null,
+      newSummary: row[6] || '',
+      diffNote: row[7] || null,
+    };
+  });
+}
+
+/** 指定したitemIdの変更履歴（新しい順）をシートから読んで返す。最大50件まで。 */
+function getHistoryForItem_(itemId) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(HISTORY_SHEET_NAME_);
+  if (!sheet) return [];
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return [];
+  var values = sheet.getRange(2, 1, lastRow - 1, HISTORY_HEADER_.length).getValues();
+  return filterAndFormatHistoryRows_(values, itemId).slice(0, 50);
+}
+
 function appendRunLogs_(logs) {
   if (!logs || logs.length === 0) return;
   var ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -1323,13 +1400,18 @@ function fetchAndParseCsv_(url) {
 }
 
 /**
- * PMDA回収情報を取得し、{ sourceId, success, items, fetchedAt, error } の形で返す。
+ * 指定したクラス（1/2/3）のPMDA回収情報を取得し、
+ * { sourceId, success, items, fetchedAt, error } の形で返す。
  * 「取得成功で0件」と「通信・解析失敗」を明確に区別する
  * （fetchAndParseCsv_がnullを返す＝失敗、空配列を返す＝成功で0件）。
+ *
+ * クラスごとに独立したsourceIdで結果を返す（PMDA_RECALL_CLASSES_参照）。これにより、
+ * 呼び出し側（runConvertAllToInformationItems）でクラスごとに成功/失敗を分離して
+ * source_run_logsに記録でき、1クラスの取得失敗が他クラスの更新を巻き込まない。
  */
-function fetchPmdaRecallSourceResult_() {
+function fetchPmdaRecallSourceResult_(recallClass, sourceId) {
   var startedAt = new Date().toISOString();
-  var candidates = pmdaFiscalYearCandidates_(new Date());
+  var candidates = pmdaFiscalYearCandidatesForClass_(new Date(), recallClass);
   var rows = null;
   var usedUrl = null;
   var lastError = null;
@@ -1356,19 +1438,26 @@ function fetchPmdaRecallSourceResult_() {
 
   if (rows === null) {
     return {
-      sourceId: 'pmda_recall',
+      sourceId: sourceId,
       success: false,
       items: [],
       fetchedAt: fetchedAtIso,
       startedAt: startedAt,
-      error: lastError || 'PMDA回収情報の取得に失敗しました（候補年度すべて）',
+      error: lastError || 'PMDA回収情報（クラス' + recallClass + '）の取得に失敗しました（候補年度すべて）',
     };
   }
 
   var listPageUrl = usedUrl.replace('.csv', '.html');
-  var items = buildPmdaIncomingItems_(rows, listPageUrl, fetchedAtIso);
+  var items = buildPmdaIncomingItems_(rows, listPageUrl, fetchedAtIso, sourceId);
 
-  return { sourceId: 'pmda_recall', success: true, items: items, fetchedAt: fetchedAtIso, startedAt: startedAt, error: null };
+  return { sourceId: sourceId, success: true, items: items, fetchedAt: fetchedAtIso, startedAt: startedAt, error: null };
+}
+
+/** PMDA_RECALL_CLASSES_の全クラス（I・II・III）を取得し、結果の配列を返す。 */
+function fetchAllPmdaRecallSourceResults_() {
+  return PMDA_RECALL_CLASSES_.map(function (c) {
+    return fetchPmdaRecallSourceResult_(c.recallClass, c.sourceId);
+  });
 }
 
 // ---- 厚労省供給状況：ネットワーク取得（GAS依存） ----
@@ -1528,7 +1617,7 @@ function runConvertAllToInformationItems() {
   var preFetchExistingById = readExistingItemsById_();
   var existingMhlwStates = pickStatesBySourceId_(preFetchExistingById, 'mhlw_supply');
 
-  var pmdaResult = fetchPmdaRecallSourceResult_();
+  var pmdaResults = fetchAllPmdaRecallSourceResults_(); // クラスI・II・IIIをそれぞれ独立して取得
   var mhlwResult = fetchMhlwSupplySourceResult_(existingMhlwStates);
 
   var lock = LockService.getScriptLock();
@@ -1549,15 +1638,19 @@ function runConvertAllToInformationItems() {
     // ロックを取った直後に最新状態を読み直す（取得中に行われた人間の操作を取りこぼさないため）。
     var existingById = readExistingItemsById_();
     var nowIso = new Date().toISOString();
-    var applied = applyFetchResultsToState_(existingById, [pmdaResult, mhlwResult], nowIso);
+    var applied = applyFetchResultsToState_(existingById, pmdaResults.concat([mhlwResult]), nowIso);
 
     writeInformationItemsSheet_(applied.updatedById);
     appendHistoryEntries_(applied.historyEntries);
     appendRunLogs_(applied.runLogs);
 
+    var pmdaSummary = pmdaResults
+      .map(function (r) {
+        return r.sourceId + ': ' + (r.success ? '成功(' + r.items.length + '件)' : '失敗: ' + r.error);
+      })
+      .join(' / ');
     Logger.log(
-      'PMDA: ' +
-        (pmdaResult.success ? '成功(' + pmdaResult.items.length + '件)' : '失敗: ' + pmdaResult.error) +
+      pmdaSummary +
         ' / 厚労省供給: ' +
         (mhlwResult.success ? '成功(' + mhlwResult.items.length + '件)' : '失敗: ' + mhlwResult.error),
     );
@@ -1600,10 +1693,10 @@ function runSingleSourceConversion_(fetchResultsBuilderFn) {
   }
 }
 
-/** PMDA回収情報だけを取得してマージする（動作確認用の単体実行）。 */
+/** PMDA回収情報（クラスI・II・III）だけを取得してマージする（動作確認用の単体実行）。 */
 function runConvertPmdaRecallToInformationItems() {
   runSingleSourceConversion_(function () {
-    return [fetchPmdaRecallSourceResult_()];
+    return fetchAllPmdaRecallSourceResults_();
   });
 }
 
@@ -1649,6 +1742,16 @@ function saveWatchSettings_(settings) {
  * URLを知っていれば誰でもこのデータを閲覧できる状態です。
  */
 function doGet(e) {
+  var action = e && e.parameter && e.parameter.action;
+
+  if (action === 'history') {
+    var itemId = e.parameter.itemId;
+    if (!itemId) {
+      return jsonResponse_({ error: 'itemIdが指定されていません' });
+    }
+    return jsonResponse_({ itemId: itemId, history: getHistoryForItem_(itemId) });
+  }
+
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var sheet = ss.getSheetByName(INFO_ITEMS_SHEET_NAME);
   var now = new Date().toISOString();

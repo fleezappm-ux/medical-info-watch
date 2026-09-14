@@ -48,7 +48,7 @@ describe('computeContentHash_', () => {
   })
 })
 
-describe('currentJapaneseFiscalYear2Digit_ / pmdaFiscalYearCandidates_', () => {
+describe('currentJapaneseFiscalYear2Digit_ / pmdaFiscalYearCandidatesForClass_', () => {
   it('4月以降はその年の年度になる', () => {
     expect(gas.currentJapaneseFiscalYear2Digit_(new Date('2026-04-01T00:00:00+09:00'))).toBe('26')
     expect(gas.currentJapaneseFiscalYear2Digit_(new Date('2027-03-31T00:00:00+09:00'))).toBe('26')
@@ -58,12 +58,69 @@ describe('currentJapaneseFiscalYear2Digit_ / pmdaFiscalYearCandidates_', () => {
     expect(gas.currentJapaneseFiscalYear2Digit_(new Date('2027-01-15T00:00:00+09:00'))).toBe('26')
   })
 
-  it('候補は現在年度→前年度の順でクラスIのみ', () => {
-    const candidates = gas.pmdaFiscalYearCandidates_(new Date('2026-09-14T00:00:00+09:00'))
+  it('候補は現在年度→前年度の順（クラスIを指定した場合）', () => {
+    const candidates = gas.pmdaFiscalYearCandidatesForClass_(new Date('2026-09-14T00:00:00+09:00'), 1)
     expect(candidates).toEqual([
       { fiscalYear2Digit: '26', recallClass: 1 },
       { fiscalYear2Digit: '25', recallClass: 1 },
     ])
+  })
+
+  it('クラスII・IIIを指定した場合も同じ年度候補で、recallClassだけ切り替わる', () => {
+    const date = new Date('2026-09-14T00:00:00+09:00')
+    expect(gas.pmdaFiscalYearCandidatesForClass_(date, 2)).toEqual([
+      { fiscalYear2Digit: '26', recallClass: 2 },
+      { fiscalYear2Digit: '25', recallClass: 2 },
+    ])
+    expect(gas.pmdaFiscalYearCandidatesForClass_(date, 3)).toEqual([
+      { fiscalYear2Digit: '26', recallClass: 3 },
+      { fiscalYear2Digit: '25', recallClass: 3 },
+    ])
+  })
+
+  it('PMDA_RECALL_CLASSES_にクラスI・II・IIIが独立したsourceIdで定義されている', () => {
+    expect(gas.PMDA_RECALL_CLASSES_).toEqual([
+      { recallClass: 1, sourceId: 'pmda_recall_class1' },
+      { recallClass: 2, sourceId: 'pmda_recall_class2' },
+      { recallClass: 3, sourceId: 'pmda_recall_class3' },
+    ])
+  })
+})
+
+describe('extractRecallClassLabel_（表示用クラス名の抽出）', () => {
+  it('クラスIII・II・Iを正しく判定する（部分文字列の誤判定に注意した順序）', () => {
+    expect(gas.extractRecallClassLabel_('（クラスIII）')).toBe('クラスIII')
+    expect(gas.extractRecallClassLabel_('（クラスII）')).toBe('クラスII')
+    expect(gas.extractRecallClassLabel_('（クラスI）')).toBe('クラスI')
+  })
+
+  it('判定不能な文字列は「クラス不明」を返す', () => {
+    expect(gas.extractRecallClassLabel_('')).toBe('クラス不明')
+    expect(gas.extractRecallClassLabel_(undefined)).toBe('クラス不明')
+  })
+})
+
+describe('buildPmdaRecallItem_ のsourceId付きid生成', () => {
+  it('idはsourceId + 回収番号になり、クラスをまたいでも回収番号が同じならsourceIdで区別される', () => {
+    const row = [
+      '1-9999', // 回収番号
+      "'2026/06/26", // 掲載年月日
+      '医薬品', // 種類
+      '', // 回収概要作成日及び訂正日
+      '（クラスII）', // クラス分類
+      '販売名：テスト薬', // 一般的名称及び販売名
+      '', '', '理由テスト', '', '', '', '', '', '', // 残りの列
+    ]
+    const itemClass2 = gas.buildPmdaRecallItem_(row, 'https://example.com/list.html', '2026-09-14T00:00:00.000Z', 'pmda_recall_class2')
+    expect(itemClass2.id).toBe('pmda_recall_class2_1-9999')
+    expect(itemClass2.sourceRecordId).toBe('1-9999')
+    expect(itemClass2.aiImportance).toBe('caution')
+    expect(itemClass2.sourceName).toContain('クラスII')
+
+    const itemClass3 = gas.buildPmdaRecallItem_(row, 'https://example.com/list.html', '2026-09-14T00:00:00.000Z', 'pmda_recall_class3')
+    expect(itemClass3.id).toBe('pmda_recall_class3_1-9999')
+    // 同じ回収番号でもsourceIdが違うのでidは衝突しない
+    expect(itemClass3.id).not.toBe(itemClass2.id)
   })
 })
 
@@ -573,5 +630,39 @@ describe('mapRecallClassToImportance_ / mapShippingStatusToImportance_ （既存
     expect(gas.mapShippingStatusToImportance_('供給停止')).toBe('critical')
     expect(gas.mapShippingStatusToImportance_('限定出荷')).toBe('caution')
     expect(gas.mapShippingStatusToImportance_('通常出荷')).toBe('info')
+  })
+})
+
+describe('filterAndFormatHistoryRows_（変更履歴の抽出・整形）', () => {
+  // HISTORY_HEADER_の並び：itemId, sourceId, detectedAt, previousHash, newHash, previousSummary, newSummary, diffNote
+  const rows = [
+    ['item_a', 'pmda_recall_class1', '2026-09-01T00:00:00.000Z', 'h0', 'h1', '旧summary1', '新summary1', null],
+    ['item_b', 'mhlw_supply', '2026-09-02T00:00:00.000Z', 'h0', 'h1', '旧summaryB', '新summaryB', null],
+    ['item_a', 'pmda_recall_class1', '2026-09-10T00:00:00.000Z', 'h1', 'h2', '新summary1', '新summary2', null],
+  ]
+
+  it('指定したitemIdの行だけを抽出する', () => {
+    const result = gas.filterAndFormatHistoryRows_(rows, 'item_a')
+    expect(result).toHaveLength(2)
+  })
+
+  it('新しい順（detectedAt降順）に並ぶ', () => {
+    const result = gas.filterAndFormatHistoryRows_(rows, 'item_a')
+    expect(result[0].newSummary).toBe('新summary2')
+    expect(result[1].newSummary).toBe('新summary1')
+  })
+
+  it('previousHash/newHashは画面に返す必要がないため含まない', () => {
+    const result = gas.filterAndFormatHistoryRows_(rows, 'item_a')
+    expect(result[0]).toEqual({
+      detectedAt: '2026-09-10T00:00:00.000Z',
+      previousSummary: '新summary1',
+      newSummary: '新summary2',
+      diffNote: null,
+    })
+  })
+
+  it('該当するitemIdが無ければ空配列を返す', () => {
+    expect(gas.filterAndFormatHistoryRows_(rows, 'item_not_exist')).toEqual([])
   })
 })
