@@ -1,30 +1,45 @@
-# 医療情報ウォッチ（初期版・モックデータ）
+# 医療情報ウォッチ（v3・PoC）
 
 薬局・クリニック向けの規制/臨床情報 収集・重要度判定ツール。
 [Pharmacy OS](https://github.com/fleezappm-ux/pharmacy-os) からは完全に独立して動作する。
 
 ## 現在の状態（このコミット）
 
-- **実データ取得なし**：全件モックデータ（`src/data/mockItems.ts`）
-- 画面：情報一覧（全件／要確認／重要情報（確定）／取得エラー）、詳細画面（原資料リンク分離）、ウォッチ設定（OFF／監視ON／HOME表示ON）
-- Pharmacy OS連携API・実ボット・通知機能は未実装（申し送りメモ「14. 初期版で作り込まないもの」に準拠）
+### 実装済み
 
-### 監査対応（このコミットで修正）
+- **PMDA回収情報**の取得（年度・クラスごとのCSV、現在はクラスIのみ。年度は日付から自動算出）
+- **厚生労働省 医療用医薬品供給状況**の取得（限定出荷・供給停止・供給再開の検知を含む）
+- 毎朝7時台の**自動取得トリガー**（GAS）
+- 確認状態・重要度確定・HOME表示確定・ウォッチ設定の**永続化**（Googleスプレッドシート・PropertiesService）
+- **情報源ごとの取得成功/失敗を分離管理**し、一方が失敗しても他方・失敗側の既存情報を消さない
+- **内容変更のハッシュ検知（SHA-256）**：内容が変わった情報は人間の再確認状態へ自動的に戻す（HOME表示は維持しつつ「再確認必要」フラグを立てる）
+- **供給再開・限定出荷解除の検知**：Excelで明示的に「通常出荷」を確認できた場合だけ解消と判定する。単にExcelから品目が消えただけの場合は「掲載未確認（要手動確認）」として扱い、内容・HOME表示は前回のまま維持する（誤って供給再開扱いにしない）
+- **再確認フラグの解除条件を限定**：「内容を確認済みにする」を明示的に行った場合のみ解除される。GAS側でも、再確認が必要な情報は先に確認済みにしないと重要度・HOME表示の変更を受け付けない
+- **ウォッチ設定IDの固定許可リスト**：初回保存前でも任意のIDを保存できないよう、GAS側に固定リストを持たせている
+- GAS側の**排他制御（LockService）**：自動取得と人間の操作が同時に走っても確認状態が失われない。外部への取得はロックの外で行い、シート更新の直前にロックを取って最新状態を読み直す構成
+- GAS側の**入力値検証**：`doPost`はホワイトリスト方式で値を検証し、対象外(excluded)情報の変更・重要度未確定でのHOME表示ONなどの業務ルールをサーバー側でも強制
+- **GitHub Pages公開済み**：https://fleezappm-ux.github.io/medical-info-watch/
 
-1. 「内容確認」「重要度確定」「HOME表示確定」を3つの独立操作に分離。AI判定を人間の確定値へ自動コピーしない（`src/lib/review.ts`, `App.tsx`）
-2. 重要度・HOME表示の確定者・確定日時を型に追加（`importanceConfirmedBy/At`, `homeDisplayConfirmedBy/At`）
-3. 「重要情報」タブは人間が確定したものだけに限定。AI候補のみの情報は含めない（`isConfirmedImportant`）
-4. `excluded`（対象外）は内容確認・重要度確定・HOME表示確定の対象外にした
-5. 「本日の取得」件数を`fetchedAt`の日付（JST基準）で正しく集計（`isSameLocalDay`）
-6. 「取得エラー」専用タブを追加
-7. `src/lib/review.ts`のルールに対する最低限のユニットテストを追加（`npm run test`）
+### 現在のセキュリティレベル（重要）
 
-### 既知の未対応（次段階）
+このアプリは現在、**認証未実装のPoC**です。GASのWeb Appは「アクセスできるユーザー：全員」で公開されており、**API URLを知っている人なら誰でも確認状態・重要度・ウォッチ設定を書き換えられます**。入力値の形式検証・業務ルールのチェックはサーバー側（GAS）に追加済みですが、これは「不正な値を弾く」ためのものであり、「本人確認をする」ものではありません。
 
-- ウォッチ設定・確認状態はページ再読み込みで消える（永続化なし）
-- 疾患・診療科・ガイドライン単位の詳細設定は未実装
-- 認証・ロール・施設分離は未実装（確定者名は固定値）
-- 実データ取得・DB・通知・Pharmacy OS連携APIは未実装
+本番運用の前には、認証付き中継バックエンドまたは共通ログイン基盤の導入が必須の課題として残っています。
+
+### 現在取得している情報範囲
+
+- PMDA回収情報：**2026年度（該当データが無ければ前年度）クラスIのみ**。クラスII・IIIは未取得
+- 厚労省供給状況：限定出荷・供給停止・供給再開（一覧には出さないが変更として検知）のみ。それ以外の通常出荷品目は表示しない
+
+### 現在取得していない情報範囲（申し送りメモ「14. 今回触らないもの」に準拠）
+
+- ガイドライン検索・最新治療薬・治療情報・医療システム情報・クリニック業務の各ボット
+- Pharmacy OS HOME連携API
+- 本格ログイン画面・通知機能（メール・LINE等）
+
+## 画面
+
+情報一覧（全件／要確認／重要情報（確定）／取得エラー）、詳細画面（原資料リンク分離、変更履歴・再確認フラグの表示）、ウォッチ設定（OFF／監視ON／HOME表示ON、実データ連携URLの設定）。
 
 ## セットアップ
 
@@ -32,26 +47,20 @@
 npm install
 npm run dev      # ローカル確認 (http://localhost:5173/medical-info-watch/)
 npm run build    # dist/ に本番ビルド
+npm run test     # ユニットテスト（GASの純粋関数を含む）
+npm run lint     # Lint
 ```
 
-## GitHub Pagesへのデプロイ手順（案）
+## GASの設定・移行について
 
-1. GitHubで `fleezappm-ux/medical-info-watch` の新規リポジトリを作成（public）
-2. このフォルダの中身をpush
-   ```bash
-   git init
-   git add .
-   git commit -m "init: 情報ウォッチ 初期版 (モックデータ)"
-   git branch -M main
-   git remote add origin https://github.com/fleezappm-ux/medical-info-watch.git
-   git push -u origin main
-   ```
-3. `npm run build` で `dist/` を生成し、GitHub Pages（`gh-pages` ブランチ、または Actions によるデプロイ）で公開
-   - リポジトリ名を変えた場合は `vite.config.ts` の `base` を必ず合わせて変更すること
-4. 公開URL例：`https://fleezappm-ux.github.io/medical-info-watch/`
+`gas/pmda-recall-fetcher.gs` をGoogle Apps Scriptへ貼り付けて使う。既存のスプレッドシートに旧バージョン（v2）の「情報アイテム変換結果」シートがある場合、初回の `runConvertAllToInformationItems` 実行時に自動的に新しい `information_items` シートへ移行される（旧シートは削除されず「旧_情報アイテム変換結果」という名前で残る）。詳細は `gas/README.md` を参照。
 
-## 次のステップ（要承認）
+## GitHub Pagesへのデプロイ
 
-- PMDA／厚労省の代表的な情報源1件で実データ取得の実証（申し送りメモ「6. 情報源の基本方針」）
-- 発出番号・原文ハッシュ等を含むフルスキーマへの拡張
+`main` ブランチへのpushで `.github/workflows/deploy.yml` が自動的にビルド・デプロイする。公開URL：https://fleezappm-ux.github.io/medical-info-watch/
+
+## 次のステップ（要相談）
+
+- PMDA回収情報のクラスII・III、他の情報源への拡大
+- 認証基盤の検討（本番運用前の必須課題）
 - Pharmacy OS連携API（`GET /api/integrations/pharmacy-os/home`）の実装

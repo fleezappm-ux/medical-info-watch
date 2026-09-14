@@ -37,6 +37,29 @@ export function needsReview(item: InformationItem): boolean {
   return item.reviewStatus === 'unreviewed' || item.reviewStatus === 'reviewing'
 }
 
+/** 内容変更・供給再開などが検知され、HOME表示中でも再確認が必要な状態かどうか。 */
+export function needsHomeDisplayReview(item: InformationItem): boolean {
+  return Boolean(item.homeDisplayNeedsReview)
+}
+
+/** 一覧・詳細画面でバッジ表示するための、変更区分の日本語ラベル。無ければ何も表示しない。 */
+export function changeStatusLabel(item: InformationItem): string | null {
+  switch (item.changeStatus) {
+    case 'new':
+      return '新規'
+    case 'updated':
+      return '内容更新あり'
+    case 'resolved':
+      return '解消・供給再開'
+    case 'missing':
+      return item.missingStreak && item.missingStreak > 1
+        ? `掲載未確認・要手動確認（${item.missingStreak}回連続）`
+        : '掲載未確認・要手動確認'
+    default:
+      return null
+  }
+}
+
 const JST_TIME_ZONE = 'Asia/Tokyo'
 const jstDateFormatter = new Intl.DateTimeFormat('en-CA', {
   timeZone: JST_TIME_ZONE,

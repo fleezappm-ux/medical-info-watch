@@ -1,0 +1,577 @@
+// gas/pmda-recall-fetcher.gs（実際にGASへ貼り付けるファイルそのもの）の中から、
+// GAS API（SpreadsheetApp等）に依存しない純粋関数だけを、Node.jsのvmモジュールで
+// サンドボックス実行して検証する。ロジックを別ファイルに複製していないため、
+// ここで通れば「実際に貼り付けるコード」がテストされたことになる。
+import { describe, expect, it, beforeAll } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { createContext, Script } from 'node:vm'
+import { fileURLToPath } from 'node:url'
+import path from 'node:path'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const gasSource = readFileSync(path.join(__dirname, '..', 'gas', 'pmda-recall-fetcher.gs'), 'utf8')
+
+function loadGas() {
+  const sandbox = {}
+  createContext(sandbox)
+  // GAS専用グローバル（SpreadsheetApp等）は関数の中でしか使われていないため、
+  // ここでスクリプトを読み込むだけなら未定義のままで問題ない。
+  new Script(gasSource, { filename: 'pmda-recall-fetcher.gs' }).runInContext(sandbox)
+  return sandbox
+}
+
+let gas
+
+beforeAll(() => {
+  gas = loadGas()
+})
+
+describe('computeContentHash_', () => {
+  it('同じ内容なら同じハッシュ、違う内容なら違うハッシュになる', () => {
+    const a = gas.computeContentHash_(['x', 'y', '1'])
+    const b = gas.computeContentHash_(['x', 'y', '1'])
+    const c = gas.computeContentHash_(['x', 'y', '2'])
+    expect(a).toBe(b)
+    expect(a).not.toBe(c)
+  })
+
+  it('前後の空白・連続する空白の差だけでは別ハッシュにならない', () => {
+    const a = gas.computeContentHash_(['  高血圧   の薬  '])
+    const b = gas.computeContentHash_(['高血圧 の薬'])
+    expect(a).toBe(b)
+  })
+
+  it('null/undefinedは空文字として扱う', () => {
+    const a = gas.computeContentHash_(['x', null, 'y'])
+    const b = gas.computeContentHash_(['x', undefined, 'y'])
+    expect(a).toBe(b)
+  })
+})
+
+describe('currentJapaneseFiscalYear2Digit_ / pmdaFiscalYearCandidates_', () => {
+  it('4月以降はその年の年度になる', () => {
+    expect(gas.currentJapaneseFiscalYear2Digit_(new Date('2026-04-01T00:00:00+09:00'))).toBe('26')
+    expect(gas.currentJapaneseFiscalYear2Digit_(new Date('2027-03-31T00:00:00+09:00'))).toBe('26')
+  })
+
+  it('3月以前は前年の年度になる', () => {
+    expect(gas.currentJapaneseFiscalYear2Digit_(new Date('2027-01-15T00:00:00+09:00'))).toBe('26')
+  })
+
+  it('候補は現在年度→前年度の順でクラスIのみ', () => {
+    const candidates = gas.pmdaFiscalYearCandidates_(new Date('2026-09-14T00:00:00+09:00'))
+    expect(candidates).toEqual([
+      { fiscalYear2Digit: '26', recallClass: 1 },
+      { fiscalYear2Digit: '25', recallClass: 1 },
+    ])
+  })
+})
+
+describe('classifySupplyTransition_ 相当（mergeSourceItems_経由）と mergeSourceItems_', () => {
+  function pmdaItem(overrides = {}) {
+    return {
+      id: 'pmda_recall_1-1',
+      sourceRecordId: '1-1',
+      category: 'pharmacy',
+      itemType: '回収',
+      title: 'サンプル薬（自主回収）',
+      summary: '理由A',
+      aiImportance: 'critical',
+      publishedAt: '2026-09-01',
+      sourceName: 'PMDA（医薬品）',
+      documentNumber: '回収番号：1-1',
+      pharmacyImpact: '影響A',
+      requiredAction: null,
+      primaryUrl: 'https://example.com/a.html',
+      remarks: '',
+      contentHash: gas.computeContentHash_(['1-1', '2026-09-01', '（クラスI）', 'サンプル薬', '', '理由A', '', '', '']),
+      fetchedAtIso: '2026-09-14T00:00:00.000Z',
+      isResolvedCandidate: false,
+      ...overrides,
+    }
+  }
+
+  it('新規idは changeStatus=new、初期状態（未確認・未確定）になる', () => {
+    const result = gas.mergeSourceItems_('pmda_recall', [pmdaItem()], {}, '2026-09-14T00:00:00.000Z')
+    const item = result.updatedById['pmda_recall_1-1']
+    expect(item.changeStatus).toBe('new')
+    expect(item.reviewStatus).toBe('unreviewed')
+    expect(item.confirmedImportance).toBeNull()
+    expect(result.stats.addedCount).toBe(1)
+  })
+
+  it('既存idでハッシュが同じなら unchanged、確認状態を維持する', () => {
+    const incoming = pmdaItem()
+    const existing = {
+      'pmda_recall_1-1': {
+        id: 'pmda_recall_1-1',
+        sourceId: 'pmda_recall',
+        contentHash: incoming.contentHash,
+        summary: '理由A',
+        firstFetchedAt: '2026-09-11T00:00:00.000Z',
+        lastChangedAt: null,
+        reviewStatus: 'reviewed',
+        confirmedImportance: 'critical',
+        importanceConfirmedBy: 'フリちゃん',
+        importanceConfirmedAt: '2026-09-11T01:00:00.000Z',
+        homeDisplayConfirmed: true,
+        homeDisplayConfirmedBy: 'フリちゃん',
+        homeDisplayConfirmedAt: '2026-09-11T01:00:00.000Z',
+        homeDisplayNeedsReview: false,
+      },
+    }
+    const result = gas.mergeSourceItems_('pmda_recall', [incoming], existing, '2026-09-14T00:00:00.000Z')
+    const item = result.updatedById['pmda_recall_1-1']
+    expect(item.changeStatus).toBe('unchanged')
+    expect(item.reviewStatus).toBe('reviewed')
+    expect(item.confirmedImportance).toBe('critical')
+    expect(item.homeDisplayConfirmed).toBe(true)
+    expect(item.firstFetchedAt).toBe('2026-09-11T00:00:00.000Z')
+    expect(result.stats.unchangedCount).toBe(1)
+    expect(result.historyEntries).toHaveLength(0)
+  })
+
+  it('既存idでハッシュが違えば updated になり、reviewStatusはunreviewedへ戻る（HOME表示は維持しつつ再確認フラグが立つ）', () => {
+    const incoming = pmdaItem({ summary: '理由B（訂正後）' })
+    const existing = {
+      'pmda_recall_1-1': {
+        id: 'pmda_recall_1-1',
+        sourceId: 'pmda_recall',
+        contentHash: 'まったく別のハッシュ',
+        summary: '理由A',
+        firstFetchedAt: '2026-09-11T00:00:00.000Z',
+        lastChangedAt: null,
+        reviewStatus: 'reviewed',
+        confirmedImportance: 'critical',
+        importanceConfirmedBy: 'フリちゃん',
+        importanceConfirmedAt: '2026-09-11T01:00:00.000Z',
+        homeDisplayConfirmed: true,
+        homeDisplayConfirmedBy: 'フリちゃん',
+        homeDisplayConfirmedAt: '2026-09-11T01:00:00.000Z',
+        homeDisplayNeedsReview: false,
+      },
+    }
+    const result = gas.mergeSourceItems_('pmda_recall', [incoming], existing, '2026-09-14T00:00:00.000Z')
+    const item = result.updatedById['pmda_recall_1-1']
+    expect(item.changeStatus).toBe('updated')
+    expect(item.reviewStatus).toBe('unreviewed')
+    expect(item.confirmedImportance).toBeNull()
+    expect(item.homeDisplayConfirmed).toBe(true) // HOME表示自体は維持
+    expect(item.homeDisplayNeedsReview).toBe(true) // ただし再確認が必要と分かるようにする
+    expect(result.stats.updatedCount).toBe(1)
+    expect(result.historyEntries).toHaveLength(1)
+    expect(result.historyEntries[0].diffNote).toBe('内容変更を検知')
+  })
+
+  it('対象外(excluded)の情報は内容が変わっても対象外のまま維持する', () => {
+    const incoming = pmdaItem({ summary: '理由C（変更）' })
+    const existing = {
+      'pmda_recall_1-1': {
+        id: 'pmda_recall_1-1',
+        sourceId: 'pmda_recall',
+        contentHash: '別ハッシュ',
+        summary: '理由A',
+        firstFetchedAt: '2026-09-11T00:00:00.000Z',
+        lastChangedAt: null,
+        reviewStatus: 'excluded',
+        confirmedImportance: null,
+        importanceConfirmedBy: null,
+        importanceConfirmedAt: null,
+        homeDisplayConfirmed: false,
+        homeDisplayConfirmedBy: null,
+        homeDisplayConfirmedAt: null,
+        homeDisplayNeedsReview: false,
+      },
+    }
+    const result = gas.mergeSourceItems_('pmda_recall', [incoming], existing, '2026-09-14T00:00:00.000Z')
+    expect(result.updatedById['pmda_recall_1-1'].reviewStatus).toBe('excluded')
+  })
+
+  it('既存データのcontentHashがnull（移行直後）なら unchanged 扱いになり、確認状態を失わない', () => {
+    const incoming = pmdaItem({ summary: '理由（移行後の初回取得）' })
+    const existing = {
+      'pmda_recall_1-1': {
+        id: 'pmda_recall_1-1',
+        sourceId: 'pmda_recall',
+        contentHash: null,
+        summary: '理由A（移行時点）',
+        firstFetchedAt: '2026-09-01T00:00:00.000Z',
+        lastChangedAt: null,
+        reviewStatus: 'reviewed',
+        confirmedImportance: 'caution',
+        importanceConfirmedBy: 'フリちゃん',
+        importanceConfirmedAt: '2026-09-01T01:00:00.000Z',
+        homeDisplayConfirmed: false,
+        homeDisplayConfirmedBy: null,
+        homeDisplayConfirmedAt: null,
+        homeDisplayNeedsReview: false,
+      },
+    }
+    const result = gas.mergeSourceItems_('pmda_recall', [incoming], existing, '2026-09-14T00:00:00.000Z')
+    const item = result.updatedById['pmda_recall_1-1']
+    expect(item.changeStatus).toBe('unchanged')
+    expect(item.reviewStatus).toBe('reviewed')
+    expect(item.confirmedImportance).toBe('caution')
+    expect(item.contentHash).toBe(incoming.contentHash) // 今回のハッシュで補完される
+  })
+})
+
+describe('buildMhlwSupplyIncomingItems_（供給再開の検知・消失時の誤判定防止）', () => {
+  function trackedState(overrides = {}) {
+    return {
+      id: 'mhlw_supply_YJ001',
+      sourceId: 'mhlw_supply',
+      sourceRecordId: 'YJ001',
+      category: 'pharmacy',
+      itemType: '供給',
+      title: 'サンプル錠（限定出荷）',
+      contentHash: 'before-hash',
+      summary: '原薬不足',
+      sourceName: '厚労省（医療用医薬品供給状況報告）',
+      documentNumber: 'YJコード：YJ001',
+      pharmacyImpact: '影響',
+      aiImportance: 'caution',
+      publishedAt: '2026-09-10',
+      remarks: '',
+      firstFetchedAt: '2026-09-10T00:00:00.000Z',
+      lastChangedAt: null,
+      reviewStatus: 'reviewed',
+      confirmedImportance: 'caution',
+      importanceConfirmedBy: 'フリちゃん',
+      importanceConfirmedAt: '2026-09-10T01:00:00.000Z',
+      homeDisplayConfirmed: true,
+      homeDisplayConfirmedBy: 'フリちゃん',
+      homeDisplayConfirmedAt: '2026-09-10T01:00:00.000Z',
+      homeDisplayNeedsReview: false,
+      missingStreak: 0,
+      ...overrides,
+    }
+  }
+
+  it('限定出荷から供給停止への悪化を検知できる', () => {
+    const before = gas.buildMhlwSupplyItem_(
+      'YJ001',
+      { productName: 'サンプル錠', manufacturer: 'A社', volume: '80%', reason: '原薬不足', startDate: '2026-09-01', resolution: '' },
+      '限定出荷',
+      'https://example.com/before.xlsx',
+      '2026-09-13T00:00:00.000Z',
+    )
+    const after = gas.buildMhlwSupplyItem_(
+      'YJ001',
+      { productName: 'サンプル錠', manufacturer: 'A社', volume: '0%', reason: '原薬不足の深刻化', startDate: '2026-09-01', resolution: '' },
+      '供給停止',
+      'https://example.com/after.xlsx',
+      '2026-09-14T00:00:00.000Z',
+    )
+    expect(before.contentHash).not.toBe(after.contentHash)
+
+    const existing = { mhlw_supply_YJ001: trackedState({ contentHash: before.contentHash }) }
+    const result = gas.mergeSourceItems_('mhlw_supply', [after], existing, '2026-09-14T00:00:00.000Z')
+    const item = result.updatedById.mhlw_supply_YJ001
+    expect(item.changeStatus).toBe('updated')
+    expect(item.reviewStatus).toBe('unreviewed')
+    expect(item.homeDisplayConfirmed).toBe(true)
+    expect(item.homeDisplayNeedsReview).toBe(true)
+  })
+
+  it('Excelで明示的に「通常出荷」と確認できた場合だけ resolved になる', () => {
+    const currentByYjCode = {
+      YJ001: {
+        status: '通常出荷',
+        fields: { productName: 'サンプル錠', manufacturer: 'A社', volume: '100%', reason: '', startDate: '2026-09-14', resolution: '' },
+      },
+    }
+    const existingStates = { YJ001: trackedState() }
+    const items = gas.buildMhlwSupplyIncomingItems_(currentByYjCode, existingStates, 'https://example.com/x.xlsx', '2026-09-14T00:00:00.000Z')
+    expect(items).toHaveLength(1)
+    expect(items[0].forcedChangeStatus).toBe('resolved')
+
+    const existing = { mhlw_supply_YJ001: trackedState() }
+    const result = gas.mergeSourceItems_('mhlw_supply', items, existing, '2026-09-14T00:00:00.000Z')
+    const item = result.updatedById.mhlw_supply_YJ001
+    expect(item.changeStatus).toBe('resolved')
+    expect(result.stats.resolvedCount).toBe(1)
+    expect(item.reviewStatus).toBe('unreviewed') // 再確認は必要
+  })
+
+  it('Excelから単に消えただけでは resolved にならず missing（要手動確認）になる。内容・HOME表示は前回のまま維持する', () => {
+    const currentByYjCode = {} // YJ001が今回のExcelに一切登場しない
+    const existingStates = { YJ001: trackedState() }
+    const items = gas.buildMhlwSupplyIncomingItems_(currentByYjCode, existingStates, 'https://example.com/x.xlsx', '2026-09-14T00:00:00.000Z')
+    expect(items).toHaveLength(1)
+    expect(items[0].forcedChangeStatus).toBe('missing')
+    expect(items[0].title).toBe('サンプル錠（限定出荷）') // 前回のタイトルをそのまま維持（不確かな新内容を作らない）
+    expect(items[0].contentHash).toBe('before-hash') // 内容不明のためハッシュも維持
+
+    const existing = { mhlw_supply_YJ001: trackedState() }
+    const result = gas.mergeSourceItems_('mhlw_supply', items, existing, '2026-09-14T00:00:00.000Z')
+    const item = result.updatedById.mhlw_supply_YJ001
+    expect(item.changeStatus).toBe('missing')
+    expect(item.reviewStatus).toBe('unreviewed') // 初回検知なので要再確認
+    expect(item.homeDisplayConfirmed).toBe(true) // HOME表示は消さない
+    expect(item.homeDisplayNeedsReview).toBe(true)
+    expect(item.missingStreak).toBe(1)
+    expect(result.stats.missingCount).toBe(1)
+    expect(result.stats.resolvedCount).toBe(0)
+  })
+
+  it('2回連続でmissingになっても、2回目は確認状態を再度リセットしない（毎回アラートが再燃しない）', () => {
+    const currentByYjCode = {}
+    const existingStates = { YJ001: trackedState({ changeStatus: 'missing', missingStreak: 1, reviewStatus: 'reviewed', homeDisplayNeedsReview: true }) }
+    const items = gas.buildMhlwSupplyIncomingItems_(currentByYjCode, existingStates, 'https://example.com/x.xlsx', '2026-09-15T00:00:00.000Z')
+
+    const existing = {
+      mhlw_supply_YJ001: trackedState({ changeStatus: 'missing', missingStreak: 1, reviewStatus: 'reviewed', homeDisplayNeedsReview: true }),
+    }
+    const result = gas.mergeSourceItems_('mhlw_supply', items, existing, '2026-09-15T00:00:00.000Z')
+    const item = result.updatedById.mhlw_supply_YJ001
+    expect(item.changeStatus).toBe('missing')
+    expect(item.missingStreak).toBe(2)
+    expect(item.reviewStatus).toBe('reviewed') // 前回すでに確認済みにしていたら、そのまま維持
+    expect(item.homeDisplayNeedsReview).toBe(true) // 前回立てたフラグもそのまま（再度は立て直さない）
+    expect(result.historyEntries).toHaveLength(0) // 2回目は履歴に追記しない（初回だけ記録）
+  })
+
+  it('再びExcelに掲載が確認できれば missingStreak は0に戻る', () => {
+    const currentByYjCode = {
+      YJ001: {
+        status: '限定出荷',
+        fields: { productName: 'サンプル錠', manufacturer: 'A社', volume: '50%', reason: '原薬不足', startDate: '2026-09-10', resolution: '' },
+      },
+    }
+    const existingStates = { YJ001: trackedState({ changeStatus: 'missing', missingStreak: 2 }) }
+    const items = gas.buildMhlwSupplyIncomingItems_(currentByYjCode, existingStates, 'https://example.com/x.xlsx', '2026-09-16T00:00:00.000Z')
+    const existing = { mhlw_supply_YJ001: trackedState({ changeStatus: 'missing', missingStreak: 2 }) }
+    const result = gas.mergeSourceItems_('mhlw_supply', items, existing, '2026-09-16T00:00:00.000Z')
+    expect(result.updatedById.mhlw_supply_YJ001.missingStreak).toBe(0)
+  })
+
+  it('未追跡の通常出荷は一覧に出さない（通常出荷が大量に流れ込まない）', () => {
+    const currentByYjCode = {
+      YJ999: {
+        status: '通常出荷',
+        fields: { productName: '普段どおりの薬', manufacturer: 'B社', volume: '100%', reason: '', startDate: '', resolution: '' },
+      },
+    }
+    const items = gas.buildMhlwSupplyIncomingItems_(currentByYjCode, {}, 'https://example.com/x.xlsx', '2026-09-14T00:00:00.000Z')
+    expect(items).toHaveLength(0)
+  })
+})
+
+describe('applyFetchResultsToState_（情報源が片方失敗しても、もう片方・失敗側の既存情報を消さない）', () => {
+  function existingState(id, sourceId) {
+    return {
+      id,
+      sourceId,
+      sourceRecordId: id,
+      contentHash: 'hash-' + id,
+      summary: 'summary-' + id,
+      firstFetchedAt: '2026-09-01T00:00:00.000Z',
+      lastFetchedAt: '2026-09-13T00:00:00.000Z',
+      lastChangedAt: null,
+      reviewStatus: 'reviewed',
+      confirmedImportance: 'caution',
+      importanceConfirmedBy: 'フリちゃん',
+      importanceConfirmedAt: '2026-09-01T01:00:00.000Z',
+      homeDisplayConfirmed: true,
+      homeDisplayConfirmedBy: 'フリちゃん',
+      homeDisplayConfirmedAt: '2026-09-01T01:00:00.000Z',
+      homeDisplayNeedsReview: false,
+    }
+  }
+
+  it('PMDA失敗・厚労省成功でも、PMDAの既存情報はそのまま残る', () => {
+    const existingById = { pmda_recall_1: existingState('pmda_recall_1', 'pmda_recall') }
+    const mhlwIncoming = {
+      id: 'mhlw_supply_YJ001',
+      sourceRecordId: 'YJ001',
+      category: 'pharmacy',
+      itemType: '供給',
+      title: 'サンプル錠（限定出荷）',
+      summary: '原薬不足',
+      aiImportance: 'caution',
+      publishedAt: '2026-09-14',
+      sourceName: '厚労省（医療用医薬品供給状況報告）',
+      documentNumber: 'YJコード：YJ001',
+      pharmacyImpact: '影響',
+      requiredAction: null,
+      primaryUrl: 'https://example.com/x.xlsx',
+      remarks: '',
+      contentHash: 'new-hash',
+      fetchedAtIso: '2026-09-14T00:00:00.000Z',
+      isResolvedCandidate: false,
+    }
+    const results = [
+      { sourceId: 'pmda_recall', success: false, items: [], fetchedAt: '2026-09-14T00:00:00.000Z', error: 'HTTP 500' },
+      { sourceId: 'mhlw_supply', success: true, items: [mhlwIncoming], fetchedAt: '2026-09-14T00:00:00.000Z', error: null },
+    ]
+    const applied = gas.applyFetchResultsToState_(existingById, results, '2026-09-14T00:00:00.000Z')
+    expect(applied.updatedById.pmda_recall_1).toEqual(existingById.pmda_recall_1) // 一切変更されない
+    expect(applied.updatedById.mhlw_supply_YJ001).toBeDefined()
+    const pmdaLog = applied.runLogs.find((l) => l.sourceId === 'pmda_recall')
+    expect(pmdaLog.success).toBe(false)
+    expect(pmdaLog.errorMessage).toBe('HTTP 500')
+  })
+
+  it('厚労省失敗・PMDA成功でも、厚労省の既存情報はそのまま残る', () => {
+    const existingById = { mhlw_supply_YJ001: existingState('mhlw_supply_YJ001', 'mhlw_supply') }
+    const results = [
+      { sourceId: 'pmda_recall', success: true, items: [], fetchedAt: '2026-09-14T00:00:00.000Z', error: null },
+      { sourceId: 'mhlw_supply', success: false, items: [], fetchedAt: '2026-09-14T00:00:00.000Z', error: 'Excel取得失敗' },
+    ]
+    const applied = gas.applyFetchResultsToState_(existingById, results, '2026-09-14T00:00:00.000Z')
+    expect(applied.updatedById.mhlw_supply_YJ001).toEqual(existingById.mhlw_supply_YJ001)
+  })
+
+  it('両方失敗したら既存情報がそのまま残る', () => {
+    const existingById = {
+      pmda_recall_1: existingState('pmda_recall_1', 'pmda_recall'),
+      mhlw_supply_YJ001: existingState('mhlw_supply_YJ001', 'mhlw_supply'),
+    }
+    const results = [
+      { sourceId: 'pmda_recall', success: false, items: [], fetchedAt: '2026-09-14T00:00:00.000Z', error: 'timeout' },
+      { sourceId: 'mhlw_supply', success: false, items: [], fetchedAt: '2026-09-14T00:00:00.000Z', error: 'timeout' },
+    ]
+    const applied = gas.applyFetchResultsToState_(existingById, results, '2026-09-14T00:00:00.000Z')
+    expect(applied.updatedById).toEqual(existingById)
+    expect(applied.runLogs.every((l) => !l.success)).toBe(true)
+  })
+
+  it('マージは既存の全idを常に保持する（成功した情報源の対象にならないidも消えない）', () => {
+    const existingById = {
+      pmda_recall_1: existingState('pmda_recall_1', 'pmda_recall'),
+      mhlw_supply_YJ001: existingState('mhlw_supply_YJ001', 'mhlw_supply'),
+    }
+    // pmda_recallは成功だが、今回のincomingにpmda_recall_1が含まれない
+    // （例：PMDAのCSVからその回収番号の行が理由もなく消えた場合）
+    const results = [
+      { sourceId: 'pmda_recall', success: true, items: [], fetchedAt: '2026-09-14T00:00:00.000Z', error: null },
+      { sourceId: 'mhlw_supply', success: false, items: [], fetchedAt: '2026-09-14T00:00:00.000Z', error: 'timeout' },
+    ]
+    const applied = gas.applyFetchResultsToState_(existingById, results, '2026-09-14T00:00:00.000Z')
+    expect(Object.keys(applied.updatedById).sort()).toEqual(['mhlw_supply_YJ001', 'pmda_recall_1'])
+  })
+})
+
+describe('入力値検証（doPostのホワイトリスト方式チェック）', () => {
+  it('reviewStatusは許可された値のみ受け付ける', () => {
+    expect(gas.validateUpdateItemStatusInput_({ id: 'pmda_recall_1', reviewStatus: 'reviewed' }).valid).toBe(true)
+    expect(gas.validateUpdateItemStatusInput_({ id: 'pmda_recall_1', reviewStatus: 'hacked' }).valid).toBe(false)
+  })
+
+  it('confirmedImportanceは許可された値のみ受け付ける', () => {
+    expect(gas.validateUpdateItemStatusInput_({ id: 'pmda_recall_1', confirmedImportance: 'critical' }).valid).toBe(true)
+    expect(gas.validateUpdateItemStatusInput_({ id: 'pmda_recall_1', confirmedImportance: 'super-critical' }).valid).toBe(false)
+  })
+
+  it('idの形式が不正なら拒否する', () => {
+    expect(gas.validateUpdateItemStatusInput_({ id: '../etc/passwd' }).valid).toBe(false)
+    expect(gas.validateUpdateItemStatusInput_({ id: '' }).valid).toBe(false)
+    expect(gas.validateUpdateItemStatusInput_({ id: 'a'.repeat(300) }).valid).toBe(false)
+  })
+
+  it('homeDisplayConfirmedはboolean以外を拒否する', () => {
+    expect(gas.validateUpdateItemStatusInput_({ id: 'pmda_recall_1', homeDisplayConfirmed: 'true' }).valid).toBe(false)
+    expect(gas.validateUpdateItemStatusInput_({ id: 'pmda_recall_1', homeDisplayConfirmed: true }).valid).toBe(true)
+  })
+
+  it('重要度未確定でHOME表示ONは拒否する', () => {
+    const check = gas.businessRuleAllowsUpdate_({ reviewStatus: 'reviewed', confirmedImportance: null }, { homeDisplayConfirmed: true })
+    expect(check.allowed).toBe(false)
+  })
+
+  it('同時にconfirmedImportanceを指定していればHOME表示ONを許可する', () => {
+    const check = gas.businessRuleAllowsUpdate_(
+      { reviewStatus: 'reviewed', confirmedImportance: null },
+      { confirmedImportance: 'critical', homeDisplayConfirmed: true },
+    )
+    expect(check.allowed).toBe(true)
+  })
+
+  it('excluded(対象外)の情報への変更はすべて拒否する', () => {
+    const check = gas.businessRuleAllowsUpdate_({ reviewStatus: 'excluded', confirmedImportance: null }, { reviewStatus: 'reviewed' })
+    expect(check.allowed).toBe(false)
+  })
+
+  it('再確認必要(homeDisplayNeedsReview)な情報は、先に確認済みにしない限り重要度・HOME表示の変更を拒否する', () => {
+    const existingState = { reviewStatus: 'unreviewed', confirmedImportance: null, homeDisplayNeedsReview: true }
+    const rejectedImportance = gas.businessRuleAllowsUpdate_(existingState, { confirmedImportance: 'caution' })
+    expect(rejectedImportance.allowed).toBe(false)
+    const rejectedHome = gas.businessRuleAllowsUpdate_(
+      { reviewStatus: 'unreviewed', confirmedImportance: 'caution', homeDisplayNeedsReview: true },
+      { homeDisplayConfirmed: true },
+    )
+    expect(rejectedHome.allowed).toBe(false)
+  })
+
+  it('再確認必要でも、同じリクエストでreviewStatus:reviewedを含めれば重要度確定を許可する', () => {
+    const check = gas.businessRuleAllowsUpdate_(
+      { reviewStatus: 'unreviewed', confirmedImportance: null, homeDisplayNeedsReview: true },
+      { reviewStatus: 'reviewed', confirmedImportance: 'caution' },
+    )
+    expect(check.allowed).toBe(true)
+  })
+
+  it('既にreviewedな情報なら、homeDisplayNeedsReviewがtrueでも通常通り重要度・HOME表示を操作できる', () => {
+    const check = gas.businessRuleAllowsUpdate_(
+      { reviewStatus: 'reviewed', confirmedImportance: 'caution', homeDisplayNeedsReview: true },
+      { homeDisplayConfirmed: true },
+    )
+    expect(check.allowed).toBe(true)
+  })
+
+  it('ウォッチ設定は既知のID・許可レベル以外を拒否する', () => {
+    const knownIds = ['watch_pharmacy', 'watch_clinic']
+    expect(gas.validateWatchSettingsInput_([{ id: 'watch_pharmacy', level: 'home' }], knownIds).valid).toBe(true)
+    expect(gas.validateWatchSettingsInput_([{ id: 'watch_unknown', level: 'home' }], knownIds).valid).toBe(false)
+    expect(gas.validateWatchSettingsInput_([{ id: 'watch_pharmacy', level: 'super' }], knownIds).valid).toBe(false)
+  })
+
+  it('固定の許可ID一覧(ALLOWED_WATCH_IDS_)には4種類が含まれ、未知のIDは拒否される', () => {
+    expect(gas.ALLOWED_WATCH_IDS_).toEqual(['watch_pharmacy', 'watch_clinic', 'watch_clinical', 'watch_system'])
+    expect(gas.validateWatchSettingsInput_([{ id: 'watch_clinical', level: 'watch' }], gas.ALLOWED_WATCH_IDS_).valid).toBe(true)
+    expect(gas.validateWatchSettingsInput_([{ id: 'watch_evil', level: 'home' }], gas.ALLOWED_WATCH_IDS_).valid).toBe(false)
+  })
+})
+
+describe('pickStatesBySourceId_', () => {
+  it('指定したsourceIdの行だけをsourceRecordIdをキーにして取り出す', () => {
+    const existingById = {
+      pmda_recall_1: { sourceId: 'pmda_recall', sourceRecordId: '1' },
+      mhlw_supply_YJ001: { sourceId: 'mhlw_supply', sourceRecordId: 'YJ001' },
+      mhlw_supply_YJ002: { sourceId: 'mhlw_supply', sourceRecordId: 'YJ002' },
+    }
+    const result = gas.pickStatesBySourceId_(existingById, 'mhlw_supply')
+    expect(Object.keys(result).sort()).toEqual(['YJ001', 'YJ002'])
+    expect(result.YJ001.sourceId).toBe('mhlw_supply')
+  })
+})
+
+describe('sanitizeCellValue_（数式インジェクション対策）', () => {
+  it('=, +, -, @ で始まる文字列の先頭にシングルクォートを付ける', () => {
+    expect(gas.sanitizeCellValue_('=SUM(A1:A10)')).toBe("'=SUM(A1:A10)")
+    expect(gas.sanitizeCellValue_('+81-90-1234-5678')).toBe("'+81-90-1234-5678")
+    expect(gas.sanitizeCellValue_('-100mg')).toBe("'-100mg")
+    expect(gas.sanitizeCellValue_('@マーク')).toBe("'@マーク")
+  })
+
+  it('通常の文字列・日付・数値はそのまま', () => {
+    expect(gas.sanitizeCellValue_('通常の薬品名')).toBe('通常の薬品名')
+    expect(gas.sanitizeCellValue_(123)).toBe(123)
+    expect(gas.sanitizeCellValue_(true)).toBe(true)
+  })
+})
+
+describe('mapRecallClassToImportance_ / mapShippingStatusToImportance_ （既存ロジックの回帰確認）', () => {
+  it('クラスIはcritical、クラスIIはcaution、それ以外はinfo', () => {
+    expect(gas.mapRecallClassToImportance_('（クラスI）')).toBe('critical')
+    expect(gas.mapRecallClassToImportance_('（クラスII）')).toBe('caution')
+    expect(gas.mapRecallClassToImportance_('（クラスIII）')).toBe('info')
+  })
+
+  it('供給停止はcritical、限定出荷はcaution、それ以外はinfo', () => {
+    expect(gas.mapShippingStatusToImportance_('供給停止')).toBe('critical')
+    expect(gas.mapShippingStatusToImportance_('限定出荷')).toBe('caution')
+    expect(gas.mapShippingStatusToImportance_('通常出荷')).toBe('info')
+  })
+})

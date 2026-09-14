@@ -1,7 +1,7 @@
 import type { ImportanceLevel, InformationItem } from '../types'
 import { ImportanceBadge } from './ImportanceBadge'
 import { categoryLabel, formatDate, importanceLabel } from '../lib/importance'
-import { canMarkReviewed, canConfirmHomeDisplay } from '../lib/review'
+import { canMarkReviewed, canConfirmHomeDisplay, changeStatusLabel, needsHomeDisplayReview } from '../lib/review'
 
 interface Props {
   item: InformationItem
@@ -31,6 +31,8 @@ export function ItemDetail({
   const relatedLinks = item.links.filter((l) => l.kind === 'related')
   const displayLevel = item.confirmedImportance ?? item.aiImportance
   const isExcluded = item.reviewStatus === 'excluded'
+  const changeLabel = changeStatusLabel(item)
+  const homeReviewNeeded = needsHomeDisplayReview(item)
 
   return (
     <article className="item-detail">
@@ -49,6 +51,7 @@ export function ItemDetail({
           <span className={`status-pill status-${item.reviewStatus}`}>
             {reviewStatusLabel[item.reviewStatus]}
           </span>
+          {changeLabel && <span className={`item-row-change item-row-change-${item.changeStatus}`}>{changeLabel}</span>}
         </div>
         <h2>{item.title}</h2>
         <dl className="item-detail-meta">
@@ -64,6 +67,12 @@ export function ItemDetail({
             <dt>発出番号</dt>
             <dd>{item.documentNumber ?? '—'}</dd>
           </div>
+          {item.lastChangedAt && (
+            <div>
+              <dt>最終変更日時</dt>
+              <dd>{formatDate(item.lastChangedAt.slice(0, 10))}</dd>
+            </div>
+          )}
           {item.actionDeadline && (
             <div>
               <dt>対応期限</dt>
@@ -75,6 +84,12 @@ export function ItemDetail({
 
       {item.fetchError && (
         <p className="fetch-error-notice">取得・解析エラー：{item.fetchError}</p>
+      )}
+
+      {homeReviewNeeded && (
+        <p className="home-review-notice">
+          この情報はHOME表示確定後に内容が変わりました。HOME表示は維持されていますが、内容を再確認してください。
+        </p>
       )}
 
       <div className="item-detail-columns">

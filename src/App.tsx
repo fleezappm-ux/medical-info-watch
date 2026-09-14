@@ -5,9 +5,10 @@ import { TabNav, type ListTab } from './components/TabNav'
 import { ItemList } from './components/ItemList'
 import { ItemDetail } from './components/ItemDetail'
 import { WatchSettings } from './components/WatchSettings'
+import { SourceStatusPanel } from './components/SourceStatusPanel'
 import { mockItems } from './data/mockItems'
 import { mockWatchSettings } from './data/mockWatchSettings'
-import type { ImportanceLevel, WatchLevel } from './types'
+import type { ImportanceLevel, SourceStatus, WatchLevel } from './types'
 import { fetchInformationItemsFromApi, postUpdateToApi } from './lib/api'
 import { canMarkReviewed, canConfirmImportance, canConfirmHomeDisplay, isConfirmedImportant, needsReview, hasFetchError } from './lib/review'
 
@@ -23,6 +24,7 @@ function App() {
   const [items, setItems] = useState(mockItems)
   const [isRealData, setIsRealData] = useState(false)
   const [watchSettings, setWatchSettings] = useState(mockWatchSettings)
+  const [sourceStatuses, setSourceStatuses] = useState<SourceStatus[]>([])
   const [apiUrl, setApiUrl] = useState(() => {
     try {
       return localStorage.getItem(API_URL_STORAGE_KEY) ?? ''
@@ -73,6 +75,7 @@ function App() {
     if (data.watchSettings) {
       setWatchSettings(data.watchSettings)
     }
+    setSourceStatuses(data.sourceStatuses ?? [])
   }
 
   // ページを開いた時点で保存済みのURLがあれば、自動で実データを読み込む。
@@ -232,6 +235,7 @@ function App() {
 
         {view === 'list' && !selectedItem && (
           <>
+            {isRealData && sourceStatuses.length > 0 && <SourceStatusPanel sourceStatuses={sourceStatuses} />}
             <TabNav active={tab} onChange={setTab} counts={counts} />
             <ItemList items={items} tab={tab} onSelect={setSelectedId} />
           </>

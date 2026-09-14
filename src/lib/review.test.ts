@@ -5,6 +5,8 @@ import {
   canConfirmHomeDisplay,
   isConfirmedImportant,
   isSameLocalDay,
+  needsHomeDisplayReview,
+  changeStatusLabel,
 } from './review'
 import type { InformationItem } from '../types'
 
@@ -94,5 +96,31 @@ describe('isSameLocalDay', () => {
 
   it('不正な日付文字列は false', () => {
     expect(isSameLocalDay('not-a-date', new Date())).toBe(false)
+  })
+})
+
+describe('needsHomeDisplayReview', () => {
+  it('homeDisplayNeedsReviewがtrueのときだけtrue', () => {
+    expect(needsHomeDisplayReview(makeItem({ homeDisplayNeedsReview: true }))).toBe(true)
+    expect(needsHomeDisplayReview(makeItem({ homeDisplayNeedsReview: false }))).toBe(false)
+    expect(needsHomeDisplayReview(makeItem({}))).toBe(false)
+  })
+})
+
+describe('changeStatusLabel', () => {
+  it('changeStatusに応じたラベルを返す', () => {
+    expect(changeStatusLabel(makeItem({ changeStatus: 'new' }))).toBe('新規')
+    expect(changeStatusLabel(makeItem({ changeStatus: 'updated' }))).toBe('内容更新あり')
+    expect(changeStatusLabel(makeItem({ changeStatus: 'resolved' }))).toBe('解消・供給再開')
+    expect(changeStatusLabel(makeItem({ changeStatus: 'unchanged' }))).toBeNull()
+    expect(changeStatusLabel(makeItem({}))).toBeNull()
+  })
+
+  it('missingは連続回数の有無でラベルが変わる', () => {
+    expect(changeStatusLabel(makeItem({ changeStatus: 'missing' }))).toBe('掲載未確認・要手動確認')
+    expect(changeStatusLabel(makeItem({ changeStatus: 'missing', missingStreak: 1 }))).toBe('掲載未確認・要手動確認')
+    expect(changeStatusLabel(makeItem({ changeStatus: 'missing', missingStreak: 3 }))).toBe(
+      '掲載未確認・要手動確認（3回連続）',
+    )
   })
 })

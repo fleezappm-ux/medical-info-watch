@@ -1,34 +1,327 @@
 /**
- * PMDA 回収情報（医薬品）取得 PoC ― CSV版（v2）
+ * 医療情報ウォッチ GAS本体（v3）
  * ------------------------------------------------------------
- * v1（HTML一覧をEUC-JPでスクレイピング）は実際に動作したが、
- * 調査の結果、PMDAは年度・クラスごとに詳細情報を含んだCSVファイルを
- * そのまま公開していることが判明したため、そちらに切り替える。
+ * v2からの主な変更点（2026-09-14 監査対応）：
+ *   1. 情報源ごとに成功/失敗を分けて扱い、失敗した情報源の既存データは一切触らない
+ *   2. 「情報アイテム変換結果」シートの全削除→作り直しをやめ、`information_items`
+ *      シートをID単位でマージして書き込む方式に変更
+ *   3. 内容のハッシュ値（contentHash）で変更を検知し、変更があれば人間の確認状態を
+ *      unreviewedへ戻す（ただしHOME表示確定は維持し、homeDisplayNeedsReviewを立てる）
+ *   4. 厚労省供給状況は「限定出荷・供給停止」だけでなく全件を走査し、
+ *      供給再開（通常出荷への復帰）も変更として検知・記録する
+ *   5. GAS側でLockService.getScriptLock()による排他制御を追加
+ *      （doPost・自動/手動の取得処理の両方）
+ *   6. doPost内で入力値をホワイトリスト方式で検証し、業務ルール
+ *      （対象外は変更不可・重要度未確定でHOME表示不可）もサーバー側で強制
+ *   7. 外部取得文字列がスプレッドシートで数式として実行されないよう無害化
  *
- * 対象CSV：
- *   https://www.info.pmda.go.jp/kaisyuu/rcidx{年度2桁}-{クラス}{区分}.csv
- *   区分：m=医薬品等／k=医療機器
- *   例）2026年度クラスI（医薬品等）: rcidx26-1m.csv
- *
- * このCSVには一覧情報に加えて、個別の「回収の概要」ページに相当する
- * 詳細項目（回収理由、健康被害の有無、回収開始日など）が
- * すべて含まれている。つまり詳細ページを別途取得する必要がない。
- *
- * 文字コードはUTF-8（BOM付き）。GASのUtilities.parseCsvが
- * 引用符・改行を含むセルも正しく解釈してくれるため、v1のような
- * 正規表現によるHTML解析は不要になった。
- *
- * 使い方（Apps Script エディタで）：
- *   1. このファイルをスクリプトに追加（v1のコードは全部消して置き換える）
- *   2. runPmdaRecallCsvPoc を実行（初回は権限承認）
- *   3. 実行後、「PMDA_回収情報_PoC」シートに実データが入る
- *      （v1で作った同名シートがあれば、列構成が変わるため
- *       いったんシートを削除してから実行するのがおすすめ）
+ * ファイル構成（このファイル内で完結。複数ファイルに分けていない理由：
+ * フリちゃんが「ファイル全体を丸ごと貼り替える」運用のため、単一ファイルの方が
+ * 貼り間違いが起きにくい）：
+ *   セクションA：GAS API に依存しない純粋関数（Node.jsのテストからも直接読み込んで検証している）
+ *   セクションB：スプレッドシート・ネットワークアクセスを伴う実処理
+ *   セクションC：Web App化（doGet / doPost）
+ *   セクションD：定期自動実行トリガー
+ *   セクションE：旧バージョン互換のPoC・デバッグ用関数
  */
 
-var PMDA_RECALL_SHEET_NAME = 'PMDA_回収情報_PoC';
+/* ============================================================
+ * セクションA：GAS API に依存しない純粋関数
+ * ------------------------------------------------------------
+ * この区画の関数は SpreadsheetApp / UrlFetchApp / PropertiesService / LockService /
+ * Drive などのGAS専用オブジェクトを一切使っていない。そのため、
+ * test/gas-pure-logic.test.mjs から Node.js の vm モジュールでこのファイルを
+ * そのまま読み込んで、実際にGASへ貼り付けるコードをそのままテストできる。
+ * ============================================================ */
 
-// CSVの列見出し（この順番で並んでいる）
+// ---- 内容ハッシュ（変更検知用。SHA-256をGAS API非依存の純粋JSで実装） ----
+
+/**
+ * SHA-256（純粋なJavaScript実装、外部ライブラリ・GAS専用APIに依存しない）。
+ * 入力はUTF-8バイト列を表す文字列（1文字=1バイト、utf8Bytes_で変換したもの）を渡すこと。
+ * 実装はNode.jsの`crypto`モジュールが返す結果と一致することをテストで確認済み
+ * （test/gas-pure-logic.test.mjs）。
+ */
+function sha256Hex_(ascii) {
+  function rightRotate(value, amount) {
+    return (value >>> amount) | (value << (32 - amount));
+  }
+
+  var mathPow = Math.pow;
+  var maxWord = mathPow(2, 32);
+  var lengthProperty = 'length';
+  var i, j;
+  var result = '';
+
+  var words = [];
+  var asciiBitLength = ascii[lengthProperty] * 8;
+
+  var hash = sha256Hex_.h = sha256Hex_.h || [];
+  var k = sha256Hex_.k = sha256Hex_.k || [];
+  var primeCounter = k[lengthProperty];
+
+  var isComposite = {};
+  for (var candidate = 2; primeCounter < 64; candidate++) {
+    if (!isComposite[candidate]) {
+      for (i = 0; i < 313; i += candidate) {
+        isComposite[i] = candidate;
+      }
+      hash[primeCounter] = (mathPow(candidate, 0.5) * maxWord) | 0;
+      k[primeCounter++] = (mathPow(candidate, 1 / 3) * maxWord) | 0;
+    }
+  }
+
+  ascii += '\x80';
+  while (ascii[lengthProperty] % 64 - 56) ascii += '\x00';
+  for (i = 0; i < ascii[lengthProperty]; i++) {
+    j = ascii.charCodeAt(i);
+    if (j >> 8) return ''; // ASCII（0-255）以外が混入した場合は呼び出し側のutf8Bytes_変換漏れ
+    words[i >> 2] |= j << ((3 - (i % 4)) * 8);
+  }
+  words[words[lengthProperty]] = (asciiBitLength / maxWord) | 0;
+  words[words[lengthProperty]] = asciiBitLength;
+
+  for (j = 0; j < words[lengthProperty]; ) {
+    var w = words.slice(j, (j += 16));
+    var oldHash = hash;
+    hash = hash.slice(0, 8);
+
+    for (i = 0; i < 64; i++) {
+      var w15 = w[i - 15];
+      var w2 = w[i - 2];
+      var a = hash[0];
+      var e = hash[4];
+      var temp1 =
+        hash[7] +
+        (rightRotate(e, 6) ^ rightRotate(e, 11) ^ rightRotate(e, 25)) +
+        ((e & hash[5]) ^ (~e & hash[6])) +
+        k[i] +
+        (w[i] =
+          i < 16
+            ? w[i]
+            : ((w[i - 16] +
+                (rightRotate(w15, 7) ^ rightRotate(w15, 18) ^ (w15 >>> 3)) +
+                w[i - 7] +
+                (rightRotate(w2, 17) ^ rightRotate(w2, 19) ^ (w2 >>> 10))) |
+              0));
+      var temp2 =
+        (rightRotate(a, 2) ^ rightRotate(a, 13) ^ rightRotate(a, 22)) +
+        ((a & hash[1]) ^ (a & hash[2]) ^ (hash[1] & hash[2]));
+
+      hash = [(temp1 + temp2) | 0].concat(hash);
+      hash[4] = (hash[4] + temp1) | 0;
+    }
+
+    for (i = 0; i < 8; i++) {
+      hash[i] = (hash[i] + oldHash[i]) | 0;
+    }
+  }
+
+  for (i = 0; i < 8; i++) {
+    for (j = 3; j + 1; j--) {
+      var b = (hash[i] >> (j * 8)) & 255;
+      result += (b < 16 ? '0' : '') + b.toString(16);
+    }
+  }
+  return result;
+}
+
+/** 文字列をUTF-8のバイト列（1文字=1バイトの文字列）に変換する（sha256Hex_への入力用）。 */
+function utf8Bytes_(str) {
+  return unescape(encodeURIComponent(str));
+}
+
+/**
+ * 複数フィールドを正規化して連結し、SHA-256のハッシュ値（16進文字列）を返す。
+ * 前後の空白・連続する空白の差だけで「変更あり」と誤検知しないよう正規化する。
+ */
+function computeContentHash_(parts) {
+  var normalized = parts
+    .map(function (p) {
+      if (p === null || p === undefined) return '';
+      return String(p).trim().replace(/\s+/g, ' ');
+    })
+    .join('\u0001');
+  return sha256Hex_(utf8Bytes_(normalized));
+}
+
+/** PMDA回収情報のうち、内容変更判定に使うフィールドを決まった順序の配列にする。 */
+function pmdaRecallHashFields_(f) {
+  return [
+    f.recallNumber,
+    f.publishedAt,
+    f.recallClass,
+    f.productName,
+    f.lotInfo,
+    f.reason,
+    f.healthRisk,
+    f.startDate,
+    f.remarks,
+  ];
+}
+
+/** 厚労省供給状況のうち、内容変更判定に使うフィールドを決まった順序の配列にする。 */
+function mhlwSupplyHashFields_(f) {
+  return [f.yjCode, f.productName, f.manufacturer, f.status, f.volume, f.reason, f.startDate, f.resolution];
+}
+
+// ---- 業務ルール・入力値検証（doPostから利用） ----
+
+var ALLOWED_REVIEW_STATUSES_ = ['unreviewed', 'reviewing', 'reviewed', 'excluded'];
+var ALLOWED_IMPORTANCE_LEVELS_ = ['critical', 'caution', 'info'];
+var ALLOWED_WATCH_LEVELS_ = ['off', 'watch', 'home'];
+/**
+ * ウォッチ設定として保存を許可するIDの固定リスト。
+ * ウォッチ設定がまだ一度も保存されていない場合（getWatchSettings_がnullを返す場合）でも
+ * 任意のIDを保存できてしまわないよう、コード側に固定で持たせている
+ * （カテゴリの追加はコード変更を伴うため、ここに追記する運用でよい）。
+ */
+var ALLOWED_WATCH_IDS_ = ['watch_pharmacy', 'watch_clinic', 'watch_clinical', 'watch_system'];
+var MAX_ID_LENGTH_ = 200;
+var MAX_CONFIRMED_BY_LENGTH_ = 100;
+var MAX_WATCH_SETTINGS_COUNT_ = 50;
+var ID_PATTERN_ = /^[a-zA-Z0-9_-]+$/;
+
+function isValidIdFormat_(id) {
+  return typeof id === 'string' && id.length > 0 && id.length <= MAX_ID_LENGTH_ && ID_PATTERN_.test(id);
+}
+
+/**
+ * doPostの`action: 'updateItemStatus'`の入力値を検証する。
+ * ここでは「値の形式・許可された値かどうか」だけを見る（対象idの存在確認や
+ * 業務ルールのチェックはbusinessRuleAllowsUpdate_・呼び出し元で行う）。
+ */
+function validateUpdateItemStatusInput_(body) {
+  if (!body || typeof body !== 'object') {
+    return { valid: false, error: 'リクエスト本文が不正です' };
+  }
+  if (!isValidIdFormat_(body.id)) {
+    return { valid: false, error: 'idの形式が不正です' };
+  }
+  if (body.reviewStatus !== undefined && ALLOWED_REVIEW_STATUSES_.indexOf(body.reviewStatus) === -1) {
+    return { valid: false, error: 'reviewStatusの値が不正です' };
+  }
+  if (
+    body.confirmedImportance !== undefined &&
+    body.confirmedImportance !== null &&
+    ALLOWED_IMPORTANCE_LEVELS_.indexOf(body.confirmedImportance) === -1
+  ) {
+    return { valid: false, error: 'confirmedImportanceの値が不正です' };
+  }
+  if (body.homeDisplayConfirmed !== undefined && typeof body.homeDisplayConfirmed !== 'boolean') {
+    return { valid: false, error: 'homeDisplayConfirmedはtrue/falseで指定してください' };
+  }
+  if (
+    body.confirmedBy !== undefined &&
+    (typeof body.confirmedBy !== 'string' || body.confirmedBy.length > MAX_CONFIRMED_BY_LENGTH_)
+  ) {
+    return { valid: false, error: 'confirmedByの形式が不正です' };
+  }
+  return { valid: true };
+}
+
+/**
+ * doPostの`action: 'updateWatchSettings'`の入力値を検証する。
+ * knownIdsを渡した場合、既知のウォッチ設定ID以外は拒否する（null/undefinedならID自体はチェックしない）。
+ */
+function validateWatchSettingsInput_(settings, knownIds) {
+  if (!Array.isArray(settings)) {
+    return { valid: false, error: 'settingsは配列で指定してください' };
+  }
+  if (settings.length > MAX_WATCH_SETTINGS_COUNT_) {
+    return { valid: false, error: 'settingsの件数が多すぎます' };
+  }
+  for (var i = 0; i < settings.length; i++) {
+    var s = settings[i];
+    if (!s || typeof s !== 'object') {
+      return { valid: false, error: '不正な設定項目が含まれています' };
+    }
+    if (knownIds && knownIds.indexOf(s.id) === -1) {
+      return { valid: false, error: '不明な設定ID: ' + s.id };
+    }
+    if (ALLOWED_WATCH_LEVELS_.indexOf(s.level) === -1) {
+      return { valid: false, error: 'levelの値が不正です: ' + s.level };
+    }
+  }
+  return { valid: true };
+}
+
+/**
+ * 業務ルールのチェック（クライアント側の表示制御だけに依存しない）。
+ *   ・対象外(excluded)の情報は一切変更できない
+ *   ・重要度が未確定のままHOME表示をONにはできない
+ *   ・内容変更で「再確認必要」になっている情報は、先に「内容を確認済みにする」
+ *     （reviewStatus: 'reviewed'）を行うまで、重要度確定・HOME表示の変更を受け付けない
+ *     （原資料確認→内容確認済み→重要度再確定→HOME表示再確認、という順序をサーバー側でも強制する）
+ */
+function businessRuleAllowsUpdate_(existingState, update) {
+  if (existingState.reviewStatus === 'excluded') {
+    return { allowed: false, error: '対象外の情報は変更できません' };
+  }
+  var resultingImportance =
+    update.confirmedImportance !== undefined ? update.confirmedImportance : existingState.confirmedImportance;
+  if (update.homeDisplayConfirmed === true && !resultingImportance) {
+    return { allowed: false, error: '重要度が未確定のためHOME表示できません' };
+  }
+  var isTouchingImportanceOrHome = update.confirmedImportance !== undefined || update.homeDisplayConfirmed !== undefined;
+  var willBeReviewed = existingState.reviewStatus === 'reviewed' || update.reviewStatus === 'reviewed';
+  if (existingState.homeDisplayNeedsReview && isTouchingImportanceOrHome && !willBeReviewed) {
+    return {
+      allowed: false,
+      error: '内容が更新されているため、先に「内容を確認済みにする」を行ってから重要度・HOME表示を操作してください',
+    };
+  }
+  return { allowed: true };
+}
+
+/**
+ * 外部から取得した文字列をスプレッドシートのセルへ書き込んでも数式として
+ * 実行されないようにする（先頭が = + - @ の場合、先頭にシングルクォートを付ける）。
+ * 日付・数値・真偽値には使わないこと（文字列以外はそのまま返す）。
+ */
+function sanitizeCellValue_(value) {
+  if (typeof value !== 'string') return value;
+  if (/^[=+\-@]/.test(value)) {
+    return "'" + value;
+  }
+  return value;
+}
+
+// ---- 日本の年度計算（PMDA CSVのURLに使う年度を、固定文字列ではなく日付から算出する） ----
+
+/**
+ * 日本の年度（4月始まり）を2桁文字列で返す。例：2026年5月→'26'、2027年2月→'26'。
+ * 実行環境（GAS・Node.jsテスト等）のローカルタイムゾーン設定に結果が左右されないよう、
+ * UTC時刻に+9時間して「日本時間としての年月」をUTCメソッドで取り出す。
+ */
+function currentJapaneseFiscalYear2Digit_(date) {
+  var d = date || new Date();
+  var jst = new Date(d.getTime() + 9 * 60 * 60 * 1000);
+  var year = jst.getUTCFullYear();
+  var month = jst.getUTCMonth() + 1; // 1-12
+  var fiscalYear = month >= 4 ? year : year - 1;
+  var twoDigit = fiscalYear % 100;
+  return twoDigit < 10 ? '0' + twoDigit : String(twoDigit);
+}
+
+/**
+ * PMDA回収情報CSVの取得候補（年度・クラス）を返す。
+ * 現在はクラスIのみ（クラスII・IIIは今後の拡張対象。gas/README.md参照）。
+ * 年度は日付から自動算出するため、年度が変わってもコード修正は不要。
+ */
+function pmdaFiscalYearCandidates_(date) {
+  var currentFy = currentJapaneseFiscalYear2Digit_(date);
+  var currentFyNum = parseInt(currentFy, 10);
+  var previousFyNum = currentFyNum - 1;
+  var previousFy = previousFyNum < 0 ? '99' : previousFyNum < 10 ? '0' + previousFyNum : String(previousFyNum);
+  return [
+    { fiscalYear2Digit: currentFy, recallClass: 1 },
+    { fiscalYear2Digit: previousFy, recallClass: 1 },
+  ];
+}
+
+// ---- CSVの列見出し（この順番で並んでいる） ----
+
 var CSV_COLUMNS = [
   '回収番号',
   '掲載年月日',
@@ -48,161 +341,28 @@ var CSV_COLUMNS = [
 ];
 
 /**
- * 実行用エントリーポイント。2026年度クラスI（医薬品等）を1回だけ取得してシートへ書く。
+ * CSVの「クラス分類」列（例："（クラスI）"）→ アプリの重要度候補。
+ * 注意：'クラスIII'という文字列は'クラスII'を部分文字列として含むため、
+ * 判定順序を III → II → I にしないと、クラスIII（参考）をクラスII（注意）と
+ * 誤判定してしまう（v1・v2で潜在していたバグ。テストで発見し、ここで修正）。
  */
-function runPmdaRecallCsvPoc() {
-  var fiscalYear2Digit = '26'; // 2026年度
-  var recallClass = 1; // クラスI
-  var url =
-    'https://www.info.pmda.go.jp/kaisyuu/rcidx' +
-    fiscalYear2Digit +
-    '-' +
-    recallClass +
-    'm.csv';
-
-  Logger.log('取得先: ' + url);
-
-  var rows = fetchAndParseCsv_(url);
-  if (!rows) {
-    Logger.log('取得または解析に失敗しました。');
-    return;
-  }
-  Logger.log('データ行数（見出しを除く）: ' + rows.length);
-
-  if (rows.length === 0) {
-    Logger.log('1件もデータがありませんでした。URLやCSVの形式を確認してください。');
-    return;
-  }
-
-  writeRowsToSheet_(rows, url);
-}
-
-/**
- * CSVを取得し、UTF-8として解釈したうえでGAS標準のCSVパーサで配列に変換する。
- * 先頭のBOM（文字化けの原因になりがちな不可視文字）も取り除く。
- */
-function fetchAndParseCsv_(url) {
-  try {
-    var response = UrlFetchApp.fetch(url, {
-      muteHttpExceptions: true,
-      followRedirects: true,
-    });
-    var code = response.getResponseCode();
-    if (code !== 200) {
-      Logger.log('HTTPステータスが200以外: ' + code);
-      return null;
-    }
-
-    var text = response.getContentText('UTF-8');
-    // 先頭のBOM（\uFEFF）を除去
-    if (text.charCodeAt(0) === 0xfeff) {
-      text = text.substring(1);
-    }
-
-    var table = Utilities.parseCsv(text);
-    if (!table || table.length < 2) {
-      Logger.log('CSVの行数が想定より少ない');
-      return [];
-    }
-
-    // 1行目は見出し。想定した列数と合っているか軽く確認しておく。
-    var header = table[0];
-    if (header.length !== CSV_COLUMNS.length) {
-      Logger.log(
-        '警告：見出しの列数が想定(' +
-          CSV_COLUMNS.length +
-          ')と異なる(' +
-          header.length +
-          ')。PMDA側でCSVの形式が変わった可能性がある。',
-      );
-    }
-
-    return table.slice(1); // 見出しを除いたデータ行
-  } catch (e) {
-    Logger.log('取得・解析中にエラー: ' + e);
-    return null;
-  }
-}
-
-/**
- * 取得結果をスプレッドシートへ書き出す。
- * 重複判定：回収番号（例："1-2489"）はPMDA側が発行する一意な番号なので、
- * これだけで重複チェックができる（v1で使っていた複合キーより確実）。
- */
-function writeRowsToSheet_(rows, sourceUrl) {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName(PMDA_RECALL_SHEET_NAME);
-  var isNewSheet = false;
-  if (!sheet) {
-    sheet = ss.insertSheet(PMDA_RECALL_SHEET_NAME);
-    isNewSheet = true;
-  }
-
-  var header = ['取得日時'].concat(CSV_COLUMNS).concat(['取得元URL']);
-
-  if (isNewSheet) {
-    sheet.appendRow(header);
-    sheet.setFrozenRows(1);
-  }
-
-  var existingRecallNumbers = loadExistingRecallNumbers_(sheet);
-  var fetchedAt = new Date();
-  var appended = 0;
-  var skippedDuplicate = 0;
-
-  for (var i = 0; i < rows.length; i++) {
-    var row = rows[i];
-    var recallNumber = row[0]; // 回収番号は1列目
-
-    if (existingRecallNumbers[recallNumber]) {
-      skippedDuplicate++;
-      continue;
-    }
-
-    var outRow = [fetchedAt].concat(row).concat([sourceUrl]);
-    sheet.appendRow(outRow);
-    existingRecallNumbers[recallNumber] = true;
-    appended++;
-  }
-
-  Logger.log(
-    '書き込み完了：新規 ' + appended + ' 件、重複スキップ ' + skippedDuplicate + ' 件',
-  );
-}
-
-function loadExistingRecallNumbers_(sheet) {
-  var keys = {};
-  var lastRow = sheet.getLastRow();
-  if (lastRow < 2) return keys;
-
-  // 回収番号は「取得日時」の次、つまりB列
-  var values = sheet.getRange(2, 2, lastRow - 1, 1).getValues();
-  for (var i = 0; i < values.length; i++) {
-    keys[values[i][0]] = true;
-  }
-  return keys;
-}
-
-/* ============================================================
- * ここから：CSV行 → medical-info-watch の information_items 形式への変換
- * ============================================================ */
-
-var INFO_ITEMS_SHEET_NAME = '情報アイテム変換結果';
-
-// CSVの「クラス分類」列（例："（クラスI）"）→ アプリの重要度候補
 function mapRecallClassToImportance_(recallClassLabel) {
-  if (recallClassLabel.indexOf('クラスI') !== -1 && recallClassLabel.indexOf('クラスII') === -1 && recallClassLabel.indexOf('クラスIII') === -1) {
-    return 'critical'; // クラスI（重篤な健康被害・死亡の恐れ）
+  var label = recallClassLabel || '';
+  if (label.indexOf('クラスIII') !== -1) {
+    return 'info'; // クラスIII
   }
-  if (recallClassLabel.indexOf('クラスII') !== -1) {
+  if (label.indexOf('クラスII') !== -1) {
     return 'caution'; // クラスII
   }
-  return 'info'; // クラスIII、または判定不能
+  if (label.indexOf('クラスI') !== -1) {
+    return 'critical'; // クラスI（重篤な健康被害・死亡の恐れ）
+  }
+  return 'info'; // 判定不能
 }
 
 // CSVの「掲載年月日」列（例："'2026/06/26"）→ "2026-06-26" 形式
 function normalizePublishedAt_(rawDate) {
-  var cleaned = rawDate.replace(/^'/, '').trim();
+  var cleaned = String(rawDate || '').replace(/^'/, '').trim();
   var match = cleaned.match(/(\d{4})\/(\d{1,2})\/(\d{1,2})/);
   if (!match) return cleaned; // 形式が想定と違う場合はそのまま返す
   var y = match[1];
@@ -212,202 +372,95 @@ function normalizePublishedAt_(rawDate) {
 }
 
 /**
- * CSVの1行（配列）を、アプリのInformationItem型と同じ形のオブジェクトへ変換する。
- * 列の並びはCSV_COLUMNSの順番と一致している前提。
+ * CSVの1行（配列）を、information_items用の「今回取得した内容」オブジェクトへ変換する。
+ * 人間の確認状態（reviewStatus等）はここでは持たせない。それは
+ * mergeSourceItems_ が既存データとの比較結果から決める。
  */
-function mapCsvRowToInformationItem_(row, listPageUrl) {
+function buildPmdaRecallItem_(row, listPageUrl, fetchedAtIso) {
   var recallNumber = row[0];
   var publishedAtRaw = row[1];
-  var itemKind = row[2]; // 医薬品／医療機器／化粧品／医薬部外品
-  var recallClassLabel = row[4]; // （クラスI）等
-  var nameAndProduct = row[5]; // 一般的名称及び販売名（改行区切りの文章）
-  var lotInfo = row[6];
-  var manufacturer = row[7];
-  var reason = row[8];
-  var healthRisk = row[9];
+  var itemKind = row[2];
+  var recallClassLabel = row[4];
+  var nameAndProduct = row[5] || '';
+  var lotInfo = row[6] || '';
+  var manufacturer = row[7] || '';
+  var reason = row[8] || '';
+  var healthRisk = row[9] || '';
   var startDate = row[10];
-  var remarks = row[14];
+  var remarksRaw = row[14] || '';
 
   var importance = mapRecallClassToImportance_(recallClassLabel);
 
-  // 「一般的名称及び販売名」の中から販売名らしき行をタイトルに使う
-  var titleLine = nameAndProduct.split('\n').filter(function (line) {
-    return line.indexOf('販売名') !== -1;
-  })[0] || nameAndProduct.split('\n')[0] || '(タイトル不明)';
-  var title = titleLine.replace(/^.*[：:]\s*/, '').trim() + '（自主回収）';
+  var titleLine =
+    nameAndProduct
+      .split('\n')
+      .filter(function (line) {
+        return line.indexOf('販売名') !== -1;
+      })[0] ||
+    nameAndProduct.split('\n')[0] ||
+    '(タイトル不明)';
+  var productTitle = titleLine.replace(/^.*[：:]\s*/, '').trim();
+  var publishedAt = normalizePublishedAt_(publishedAtRaw);
+
+  var contentHash = computeContentHash_(
+    pmdaRecallHashFields_({
+      recallNumber: recallNumber,
+      publishedAt: publishedAt,
+      recallClass: recallClassLabel,
+      productName: productTitle,
+      lotInfo: lotInfo,
+      reason: reason,
+      healthRisk: healthRisk,
+      startDate: startDate,
+      remarks: remarksRaw,
+    }),
+  );
 
   return {
     id: 'pmda_recall_' + recallNumber,
+    sourceRecordId: String(recallNumber),
     category: 'pharmacy',
     itemType: '回収',
-    title: title,
-    summary: reason.trim(),
+    title: sanitizeCellValue_(productTitle + '（自主回収）'),
+    summary: sanitizeCellValue_(reason.trim()),
     aiImportance: importance,
-    confirmedImportance: null,
-    importanceConfirmedBy: null,
-    importanceConfirmedAt: null,
-    reviewStatus: 'unreviewed',
-    publishedAt: normalizePublishedAt_(publishedAtRaw),
-    fetchedAt: new Date().toISOString(),
-    sourceName: 'PMDA（' + itemKind + '）',
-    documentNumber: '回収番号：' + recallNumber,
-    pharmacyImpact: healthRisk.trim() + (manufacturer ? '\n\n【製造販売業者】\n' + manufacturer.trim() : ''),
-    requiredAction: lotInfo ? '対象ロットの確認：\n' + lotInfo.trim() : null,
-    actionDeadline: null,
-    homeDisplayConfirmed: false,
-    homeDisplayConfirmedBy: null,
-    homeDisplayConfirmedAt: null,
-    links: [
-      { label: 'PMDA 回収情報一覧（原文・該当年度/クラス）', url: listPageUrl, kind: 'primary' },
-    ],
-    fetchError: null,
-    _remarks: remarks, // 参考：備考欄（回収終了かどうか等）はアプリの型にまだ無いので別枠で保持
+    publishedAt: publishedAt,
+    sourceName: sanitizeCellValue_('PMDA（' + itemKind + '）'),
+    documentNumber: sanitizeCellValue_('回収番号：' + recallNumber),
+    pharmacyImpact: sanitizeCellValue_(
+      healthRisk.trim() + (manufacturer ? '\n\n【製造販売業者】\n' + manufacturer.trim() : ''),
+    ),
+    requiredAction: lotInfo ? sanitizeCellValue_('対象ロットの確認：\n' + lotInfo.trim()) : null,
+    primaryUrl: listPageUrl,
+    remarks: sanitizeCellValue_(remarksRaw.trim()),
+    contentHash: contentHash,
+    fetchedAtIso: fetchedAtIso,
+    isResolvedCandidate: false,
   };
 }
 
-/**
- * 2026年度クラスI（存在しなければ2025年度）を取得し、information_items形式の配列にして返す。
- * シートへの書き込みは行わない（runConvertPmdaRecallToInformationItems / runConvertAllToInformationItems から呼ばれる）。
- */
-function fetchPmdaRecallItems_() {
-  var candidates = [
-    { fiscalYear2Digit: '26', recallClass: 1 },
-    { fiscalYear2Digit: '25', recallClass: 1 },
-  ];
-
-  var rows = null;
-  var usedUrl = null;
-
-  for (var i = 0; i < candidates.length; i++) {
-    var c = candidates[i];
-    var url =
-      'https://www.info.pmda.go.jp/kaisyuu/rcidx' + c.fiscalYear2Digit + '-' + c.recallClass + 'm.csv';
-    Logger.log('試行: ' + url);
-    var result = fetchAndParseCsv_(url);
-    if (result && result.length > 0) {
-      rows = result;
-      usedUrl = url;
-      Logger.log('成功: ' + url + '（' + result.length + '件）');
-      break;
-    }
-  }
-
-  if (!rows) {
-    Logger.log('PMDA回収情報：どの候補URLからも取得できませんでした。');
-    return [];
-  }
-
-  var listPageUrl = usedUrl.replace('.csv', '.html');
+/** CSVの全行を、information_items用オブジェクトの配列に変換する（純粋関数）。 */
+function buildPmdaIncomingItems_(rows, listPageUrl, fetchedAtIso) {
   return rows.map(function (row) {
-    return mapCsvRowToInformationItem_(row, listPageUrl);
+    return buildPmdaRecallItem_(row, listPageUrl, fetchedAtIso);
   });
 }
 
-/**
- * PMDA回収情報だけを取得してシートに書き出す（従来どおりの単体実行用に残してある）。
- * 両方まとめて取得したい場合は runConvertAllToInformationItems を使うこと。
- */
-function runConvertPmdaRecallToInformationItems() {
-  var items = fetchPmdaRecallItems_();
-  if (items.length === 0) {
-    Logger.log('書き込むデータがありませんでした。');
-    return;
-  }
-  writeInformationItemsToSheet_(items);
+/** 「出荷対応」列の文言→アプリの重要度候補。通常出荷はinfo扱い（一覧には出さない運用）。 */
+function mapShippingStatusToImportance_(status) {
+  var s = status || '';
+  if (s.indexOf('供給停止') !== -1) return 'critical';
+  if (s.indexOf('限定出荷') !== -1) return 'caution';
+  return 'info';
 }
 
-/* ============================================================
- * ここから：厚労省「医療用医薬品供給状況報告」（限定出荷・供給停止）取得
- * ============================================================
- * 出典ページ（従来のExcel公開）：
- *   https://www.mhlw.go.jp/stf/seisakunitsuite/bunya/kenkou_iryou/iryou/kouhatu-iyaku/04_00003.html
- * 新システム（iyakuhin-kyokyu.mhlw.go.jp）はbot対策で単純取得ができないが、
- * このExcel公開ページは新システム稼働後も継続更新される旨、厚労省の事務連絡に
- * 明記されているため、こちらから取得する。
- *
- * ページ内に、その時点の最新Excelファイルへのリンクが
- *   https://www.mhlw.go.jp/content/10800000/{日付6桁}iyakuhinkyoukyu.xlsx
- * という形で埋め込まれている（ファイル名の日付部分は毎回変わるため、
- * 固定URLを直接指定せず、毎回ページから探し直す）。
- *
- * 事前準備（Apps Scriptエディタで1回だけ）：
- *   左側メニューの「サービス」（+アイコン）→「Drive API」を追加しておくこと。
- *   xlsxファイルをGoogleスプレッドシートに変換して中身を読むために必要。
- */
-
-var MHLW_SUPPLY_PAGE_URL =
-  'https://www.mhlw.go.jp/stf/seisakunitsuite/bunya/kenkou_iryou/iryou/kouhatu-iyaku/04_00003.html';
-
-/** 供給状況ページを開いて、その時点の最新Excelファイルへのリンクを探す。 */
-function findLatestMhlwSupplyXlsxUrl_() {
-  var response = UrlFetchApp.fetch(MHLW_SUPPLY_PAGE_URL, { muteHttpExceptions: true });
-  if (response.getResponseCode() !== 200) {
-    Logger.log('供給状況ページの取得に失敗: HTTP ' + response.getResponseCode());
-    return null;
+/** セルの値（Date型 or 文字列）を "YYYY-MM-DD" 相当の文字列に揃える。分からない形式ならそのまま返す。 */
+function formatMhlwDateCell_(value) {
+  if (!value) return '';
+  if (value instanceof Date) {
+    return Utilities.formatDate(value, 'Asia/Tokyo', 'yyyy-MM-dd');
   }
-  var html = response.getContentText('UTF-8');
-  // hrefが絶対URL（https://www.mhlw.go.jp/content/...）の場合と、
-  // ドメインを省略した相対パス（/content/...）だけの場合の両方に対応する。
-  var match = html.match(/(?:https:\/\/www\.mhlw\.go\.jp)?\/content\/10800000\/\d{6}iyakuhinkyoukyu\.xlsx/);
-  if (!match) {
-    Logger.log('供給状況ページ内にExcelファイルへのリンクが見つかりませんでした（ページ構成が変わった可能性）。');
-    var hintIndex = html.indexOf('iyakuhinkyoukyu');
-    if (hintIndex !== -1) {
-      Logger.log('参考：該当箇所付近のHTML → ' + html.substring(Math.max(0, hintIndex - 80), hintIndex + 40));
-    } else {
-      Logger.log('参考："iyakuhinkyoukyu"という文字列自体がページ内に見つかりませんでした。');
-    }
-    return null;
-  }
-  var found = match[0];
-  return found.indexOf('http') === 0 ? found : 'https://www.mhlw.go.jp' + found;
-}
-
-/**
- * 供給状況Excelを取得し、Googleスプレッドシートに変換してから中身を配列で返す。
- * 変換用に作った一時ファイルは読み終わったら削除する。
- * 戻り値は { values: 2次元配列, sourceUrl: string } または null（失敗時）。
- */
-function fetchMhlwSupplyRawTable_() {
-  var xlsxUrl = findLatestMhlwSupplyXlsxUrl_();
-  if (!xlsxUrl) return null;
-
-  Logger.log('供給状況Excel取得先: ' + xlsxUrl);
-  var xlsxResponse = UrlFetchApp.fetch(xlsxUrl, { muteHttpExceptions: true });
-  if (xlsxResponse.getResponseCode() !== 200) {
-    Logger.log('Excelファイルの取得に失敗: HTTP ' + xlsxResponse.getResponseCode());
-    return null;
-  }
-
-  var blob = xlsxResponse.getBlob();
-  var tempFileId = null;
-  try {
-    // xlsx→Googleスプレッドシートへの変換。Drive APIの高度なサービスが必要。
-    var tempFile = Drive.Files.create(
-      { name: '_一時_供給状況変換用_' + new Date().getTime(), mimeType: MimeType.GOOGLE_SHEETS },
-      blob,
-    );
-    tempFileId = tempFile.id;
-
-    var tempSpreadsheet = SpreadsheetApp.openById(tempFileId);
-    var sheet = tempSpreadsheet.getSheets()[0];
-    var values = sheet.getDataRange().getValues();
-    return { values: values, sourceUrl: xlsxUrl };
-  } catch (e) {
-    Logger.log(
-      'Excel変換・読み込み中にエラー: ' + e +
-        '（「サービス」にDrive APIを追加し忘れていないか確認してください）',
-    );
-    return null;
-  } finally {
-    if (tempFileId) {
-      try {
-        Drive.Files.remove(tempFileId); // 変換用の一時ファイルはDriveに残さず削除
-      } catch (e2) {
-        Logger.log('一時ファイルの削除に失敗（Driveに残っている可能性、手動で削除してください）: ' + e2);
-      }
-    }
-  }
+  return String(value).trim();
 }
 
 /**
@@ -437,11 +490,10 @@ function findMhlwSupplyColumnIndices_(headerRow) {
       idx.productName === undefined &&
       (label.indexOf('販売名') !== -1 || label.indexOf('品名') !== -1) &&
       label.indexOf('一般') === -1
-    ) idx.productName = i;
-    if (
-      idx.manufacturer === undefined &&
-      (label.indexOf('製造販売業者') !== -1 || label.indexOf('会社名') !== -1)
-    ) idx.manufacturer = i;
+    )
+      idx.productName = i;
+    if (idx.manufacturer === undefined && (label.indexOf('製造販売業者') !== -1 || label.indexOf('会社名') !== -1))
+      idx.manufacturer = i;
     if (idx.shippingStatus === undefined && label.indexOf('出荷対応') !== -1) idx.shippingStatus = i;
     if (idx.shippingVolume === undefined && label.indexOf('出荷量') !== -1) idx.shippingVolume = i;
     if (idx.reason === undefined && label.indexOf('理由') !== -1) idx.reason = i;
@@ -451,131 +503,410 @@ function findMhlwSupplyColumnIndices_(headerRow) {
   return idx;
 }
 
-/** 「出荷対応」列の文言→アプリの重要度候補。通常出荷はそもそも一覧に含めない想定。 */
-function mapShippingStatusToImportance_(status) {
-  if (status.indexOf('供給停止') !== -1) return 'critical';
-  if (status.indexOf('限定出荷') !== -1) return 'caution';
-  return 'info';
-}
-
-/** セルの値（Date型 or 文字列）を "YYYY-MM-DD" 相当の文字列に揃える。分からない形式ならそのまま返す。 */
-function formatMhlwDateCell_(value) {
-  if (!value) return '';
-  if (value instanceof Date) {
-    return Utilities.formatDate(value, 'Asia/Tokyo', 'yyyy-MM-dd');
-  }
-  return String(value).trim();
-}
-
-function mapSupplyRowToInformationItem_(row, idx, xlsxUrl) {
-  var yjCode = idx.yjCode !== undefined ? String(row[idx.yjCode] || '').trim() : '';
-  var productName = idx.productName !== undefined ? String(row[idx.productName] || '').trim() : '';
-  var genericName = idx.genericName !== undefined ? String(row[idx.genericName] || '').trim() : '';
-  var manufacturer = idx.manufacturer !== undefined ? String(row[idx.manufacturer] || '').trim() : '';
-  var status = idx.shippingStatus !== undefined ? String(row[idx.shippingStatus] || '').trim() : '';
-  var volume = idx.shippingVolume !== undefined ? String(row[idx.shippingVolume] || '').trim() : '';
-  var reason = idx.reason !== undefined ? String(row[idx.reason] || '').trim() : '';
-  var startDate = idx.startDate !== undefined ? formatMhlwDateCell_(row[idx.startDate]) : '';
-  var resolution = idx.resolution !== undefined ? formatMhlwDateCell_(row[idx.resolution]) : '';
+/**
+ * 1つのYJコードについて、information_items用オブジェクトを作る（純粋関数）。
+ * forcedChangeStatusを指定した場合、mergeSourceItems_はハッシュ比較を行わずその区分を採用する
+ * （'resolved'＝Excel内で明示的に通常出荷を確認できた場合のみ、呼び出し側が設定する）。
+ */
+function buildMhlwSupplyItem_(yjCode, fields, status, sourceUrl, fetchedAtIso) {
+  var f = fields || {};
+  var productName = f.productName || '';
+  var genericName = f.genericName || '';
+  var manufacturer = f.manufacturer || '';
+  var volume = f.volume || '';
+  var reason = f.reason || '';
+  var startDate = f.startDate || '';
+  var resolution = f.resolution || '';
 
   var displayName = productName || genericName || '(品名不明)';
-  var title = displayName + '（' + (status || '供給状況') + '）';
+
+  var contentHash = computeContentHash_(
+    mhlwSupplyHashFields_({
+      yjCode: yjCode,
+      productName: displayName,
+      manufacturer: manufacturer,
+      status: status,
+      volume: volume,
+      reason: reason,
+      startDate: startDate,
+      resolution: resolution,
+    }),
+  );
 
   return {
-    id: 'mhlw_supply_' + (yjCode || displayName),
+    id: 'mhlw_supply_' + yjCode,
+    sourceRecordId: yjCode,
     category: 'pharmacy',
     itemType: '供給',
-    title: title,
-    summary: reason || status,
+    title: sanitizeCellValue_(displayName + '（' + (status || '供給状況') + '）'),
+    summary: sanitizeCellValue_(reason || status || ''),
     aiImportance: mapShippingStatusToImportance_(status),
-    confirmedImportance: null,
-    importanceConfirmedBy: null,
-    importanceConfirmedAt: null,
-    reviewStatus: 'unreviewed',
     publishedAt: startDate,
-    fetchedAt: new Date().toISOString(),
     sourceName: '厚労省（医療用医薬品供給状況報告）',
-    documentNumber: yjCode ? 'YJコード：' + yjCode : null,
-    pharmacyImpact:
+    documentNumber: yjCode ? sanitizeCellValue_('YJコード：' + yjCode) : null,
+    pharmacyImpact: sanitizeCellValue_(
       '出荷量：' + (volume || '不明') + (manufacturer ? '\n\n【製造販売業者】\n' + manufacturer : ''),
-    requiredAction: resolution ? '解消見込み：' + resolution : null,
-    actionDeadline: null,
-    homeDisplayConfirmed: false,
-    homeDisplayConfirmedBy: null,
-    homeDisplayConfirmedAt: null,
-    links: [
-      { label: '厚労省 医療用医薬品供給状況（Excel原本）', url: xlsxUrl, kind: 'primary' },
-    ],
-    fetchError: null,
-    _remarks: '',
+    ),
+    requiredAction: resolution ? sanitizeCellValue_('解消見込み：' + resolution) : null,
+    primaryUrl: sourceUrl,
+    remarks: '',
+    contentHash: contentHash,
+    fetchedAtIso: fetchedAtIso,
   };
 }
 
 /**
- * 供給状況Excelを取得し、「限定出荷」「供給停止」の品目だけをinformation_items形式の配列にして返す。
- * 「通常出荷」の品目（大半を占める）はそもそも一覧に含めない。
+ * 今回のExcelでYJコードが見つからなかった場合の「掲載未確認」アイテムを作る（純粋関数）。
+ * 消えた理由（本当に通常出荷へ戻った／掲載対象の変更／一時的な欠落／Excel形式変更／解析漏れ）を
+ * 区別できないため、内容はすべて前回値をそのまま維持し、「手動確認が必要」とだけ伝える。
+ * forcedChangeStatus: 'missing' により、mergeSourceItems_は自動的に「解消」とは判定しない。
  */
-function fetchMhlwSupplyItems_() {
-  var table = fetchMhlwSupplyRawTable_();
-  if (!table) return [];
+function buildMissingMhlwSupplyItem_(yjCode, prev, sourceUrl, fetchedAtIso) {
+  return {
+    id: 'mhlw_supply_' + yjCode,
+    sourceRecordId: yjCode,
+    category: prev.category || 'pharmacy',
+    itemType: prev.itemType || '供給',
+    title: prev.title || 'YJコード：' + yjCode,
+    summary:
+      '今回の取得ではこの品目の掲載が確認できませんでした（前回確認時の内容を保持しています）。' +
+      '掲載対象の変更・一時的なデータ欠落・Excel形式変更などの可能性があるため、供給再開と決めつけず手動確認してください。' +
+      '前回の内容：' +
+      (prev.summary || ''),
+    aiImportance: prev.aiImportance || 'info',
+    publishedAt: prev.publishedAt || '',
+    sourceName: prev.sourceName || '厚労省（医療用医薬品供給状況報告）',
+    documentNumber: prev.documentNumber || null,
+    pharmacyImpact: prev.pharmacyImpact || '',
+    requiredAction: '掲載の有無を厚労省のExcelで手動確認してください（自動では解消と判定していません）',
+    primaryUrl: sourceUrl,
+    remarks: prev.remarks || '',
+    // 内容が不明なため、前回のハッシュをそのまま維持する（新しい内容として扱わない）
+    contentHash: prev.contentHash,
+    fetchedAtIso: fetchedAtIso,
+    forcedChangeStatus: 'missing',
+  };
+}
 
-  var values = table.values;
-  var headerRowIndex = findMhlwSupplyHeaderRowIndex_(values);
-  if (headerRowIndex === -1) {
-    Logger.log('供給状況Excel：見出し行（「出荷対応」を含む行）が見つかりませんでした。');
-    return [];
-  }
-
-  var idx = findMhlwSupplyColumnIndices_(values[headerRowIndex]);
-  if (idx.shippingStatus === undefined) {
-    Logger.log('供給状況Excel：「出荷対応」列の位置が特定できませんでした。');
-    return [];
-  }
-
+/**
+ * 今回取得した厚労省供給状況テーブル全体（currentByYjCode）と、
+ * 既に追跡中のYJコードの状態一覧（existingMhlwStates：sourceRecordId＝YJコードをキーにした
+ * information_itemsの既存状態オブジェクト）を突き合わせて、
+ * information_items用の「今回のインカミング一覧」を作る（純粋関数）。
+ *
+ *   ・限定出荷／供給停止：常に含める（新規・更新・変化なしはmergeSourceItems_がハッシュで判定）
+ *   ・通常出荷（Excelで明示的に確認できた場合のみ）：既に追跡中のYJコードだけ
+ *     forcedChangeStatus: 'resolved' として含める（＝供給再開の確定）
+ *   ・それ以外の想定外の文言：追跡中のものだけ、通常の変更検知（ハッシュ比較）に乗せて含める
+ *   ・既に追跡中だが今回のExcelに存在しない（消えた理由が不明）YJコード：
+ *     forcedChangeStatus: 'missing' として、内容は前回のまま・要手動確認の状態で含める
+ *     （＝「消えた＝供給再開」とは判定しない）
+ */
+function buildMhlwSupplyIncomingItems_(currentByYjCode, existingMhlwStates, sourceUrl, fetchedAtIso) {
   var items = [];
-  for (var r = headerRowIndex + 1; r < values.length; r++) {
-    var row = values[r];
-    var status = String(row[idx.shippingStatus] || '').trim();
-    if (!status) continue;
-    if (status.indexOf('限定出荷') === -1 && status.indexOf('供給停止') === -1) continue; // 通常出荷は除外
+  var seen = {};
+  var trackedYjCodes = Object.keys(existingMhlwStates);
 
-    items.push(mapSupplyRowToInformationItem_(row, idx, table.sourceUrl));
-  }
+  Object.keys(currentByYjCode).forEach(function (yjCode) {
+    var entry = currentByYjCode[yjCode];
+    var status = entry.status || '';
+    var isAbnormal = status.indexOf('限定出荷') !== -1 || status.indexOf('供給停止') !== -1;
+    var isExplicitNormal = status.indexOf('通常出荷') !== -1;
+    var wasTracked = trackedYjCodes.indexOf(yjCode) !== -1;
 
-  Logger.log('供給状況：限定出荷・供給停止 ' + items.length + ' 件（見出し行: ' + (headerRowIndex + 1) + '行目）');
+    if (!isAbnormal && !isExplicitNormal && !wasTracked) return; // 想定外の文言かつ未追跡なら無視
+    if (!isAbnormal && isExplicitNormal && !wasTracked) return; // 通常出荷かつ未追跡なら一覧に出さない
+
+    seen[yjCode] = true;
+    var item = buildMhlwSupplyItem_(yjCode, entry.fields, status, sourceUrl, fetchedAtIso);
+    if (isExplicitNormal && wasTracked) {
+      // Excelで明示的に「通常出荷」を確認できた場合のみ、供給再開（解消）と判定する
+      item.forcedChangeStatus = 'resolved';
+      item.aiImportance = 'info';
+    }
+    items.push(item);
+  });
+
+  trackedYjCodes.forEach(function (yjCode) {
+    if (seen[yjCode]) return; // 今回のExcelで見つかった（上のループで処理済み）
+    items.push(buildMissingMhlwSupplyItem_(yjCode, existingMhlwStates[yjCode], sourceUrl, fetchedAtIso));
+  });
+
   return items;
 }
 
-/** 供給状況だけを取得してシートに書き出す（動作確認用の単体実行）。 */
-function runConvertMhlwSupplyToInformationItems() {
-  var items = fetchMhlwSupplyItems_();
-  if (items.length === 0) {
-    Logger.log('書き込むデータがありませんでした。');
-    return;
-  }
-  writeInformationItemsToSheet_(items);
-}
+// ---- 変更検知・マージ（データ消失防止の中心ロジック） ----
 
 /**
- * PMDA回収情報 と 厚労省供給状況（限定出荷・供給停止） の両方を取得し、
- * まとめて「情報アイテム変換結果」シートに書き出す。今後はこれを実行すればよい。
+ * 既存の人間の確認状態（previousState）と、今回の変更区分（changeStatus）から、
+ * 新しい行に採用すべき「人間側フィールド」を決める。
+ *
+ *   ・new：初期値（未確認・未確定）
+ *   ・unchanged：既存の状態をそのまま維持
+ *   ・updated / resolved：
+ *       - 既に「対象外」だった情報は対象外のまま維持する（人間が明示的に戻すまで変えない）
+ *       - それ以外は reviewStatus を unreviewed に戻し、重要度確定はクリアする。
+ *         ただし HOME表示は安全側に倒し、確定状態そのものは維持したうえで
+ *         homeDisplayNeedsReview を立てて「再確認が必要」と分かるようにする。
  */
-function runConvertAllToInformationItems() {
-  var recallItems = fetchPmdaRecallItems_();
-  var supplyItems = fetchMhlwSupplyItems_();
-  var allItems = recallItems.concat(supplyItems);
-
-  if (allItems.length === 0) {
-    Logger.log('取得できたデータがありませんでした（回収情報・供給状況とも0件）。');
-    return;
+function decideMergedState_(previousState, changeStatus) {
+  if (!previousState || changeStatus === 'new') {
+    return {
+      reviewStatus: 'unreviewed',
+      confirmedImportance: null,
+      importanceConfirmedBy: null,
+      importanceConfirmedAt: null,
+      homeDisplayConfirmed: false,
+      homeDisplayConfirmedBy: null,
+      homeDisplayConfirmedAt: null,
+      homeDisplayNeedsReview: false,
+    };
   }
 
-  Logger.log('回収情報 ' + recallItems.length + ' 件 + 供給状況 ' + supplyItems.length + ' 件 = 合計 ' + allItems.length + ' 件');
-  writeInformationItemsToSheet_(allItems);
+  if (changeStatus === 'unchanged') {
+    return {
+      reviewStatus: previousState.reviewStatus,
+      confirmedImportance: previousState.confirmedImportance,
+      importanceConfirmedBy: previousState.importanceConfirmedBy,
+      importanceConfirmedAt: previousState.importanceConfirmedAt,
+      homeDisplayConfirmed: previousState.homeDisplayConfirmed,
+      homeDisplayConfirmedBy: previousState.homeDisplayConfirmedBy,
+      homeDisplayConfirmedAt: previousState.homeDisplayConfirmedAt,
+      homeDisplayNeedsReview: Boolean(previousState.homeDisplayNeedsReview),
+    };
+  }
+
+  // updated または resolved
+  if (previousState.reviewStatus === 'excluded') {
+    return {
+      reviewStatus: 'excluded',
+      confirmedImportance: previousState.confirmedImportance,
+      importanceConfirmedBy: previousState.importanceConfirmedBy,
+      importanceConfirmedAt: previousState.importanceConfirmedAt,
+      homeDisplayConfirmed: false,
+      homeDisplayConfirmedBy: previousState.homeDisplayConfirmedBy,
+      homeDisplayConfirmedAt: previousState.homeDisplayConfirmedAt,
+      homeDisplayNeedsReview: false,
+    };
+  }
+
+  return {
+    reviewStatus: 'unreviewed',
+    confirmedImportance: null,
+    importanceConfirmedBy: null,
+    importanceConfirmedAt: null,
+    homeDisplayConfirmed: previousState.homeDisplayConfirmed,
+    homeDisplayConfirmedBy: previousState.homeDisplayConfirmedBy,
+    homeDisplayConfirmedAt: previousState.homeDisplayConfirmedAt,
+    homeDisplayNeedsReview: Boolean(previousState.homeDisplayConfirmed),
+  };
 }
 
 /**
- * シートから読んだ「取得日時」の値をISO文字列に揃える。
+ * 1つの情報源について、今回取得したincomingItemsと既存データ（そのsourceIdの分だけ）を
+ * マージする（純粋関数）。既存データはこの情報源の分しか渡さない前提
+ * （他の情報源のデータはこの関数を呼ぶ側で触らないようにする）。
+ *
+ * changeStatusの決め方：
+ *   ・incoming.forcedChangeStatus === 'missing' → 'missing'（Excel等から消えた＝内容不明。
+ *     resolvedとは判定しない）
+ *   ・incoming.forcedChangeStatus === 'resolved' → 'resolved'（呼び出し側が明示的に
+ *     「解消を確認できた」と判断した場合のみ設定される）
+ *   ・それ以外は既存データとのハッシュ比較で 'new' / 'unchanged' / 'updated' を判定
+ *
+ * 'missing'は特別扱い：既存の状態が既に'missing'だった場合（＝2回目以降の連続欠落）は、
+ * missingStreakだけ増やして人間の確認状態は一切変えない（毎回「要再確認」が再燃しないように）。
+ * 初めて'missing'になった時だけ、'updated'と同様に確認状態をリセットし、履歴にも記録する。
+ *
+ * 既存のcontentHashがnull（旧シートからの移行直後など）の場合は「unchanged」として扱う。
+ * これにより、移行直後に「本当は変わっていないのに、ハッシュの元になる情報が完全には
+ * 引き継げず誤って変更ありと判定してしまう」問題を避ける。移行後2回目以降の取得からは、
+ * ハッシュ同士の比較で正しく変更検知される。
+ */
+function mergeSourceItems_(sourceId, incomingItems, existingById, nowIso) {
+  var updatedById = {};
+  var historyEntries = [];
+  var stats = { addedCount: 0, updatedCount: 0, unchangedCount: 0, resolvedCount: 0, missingCount: 0 };
+
+  incomingItems.forEach(function (incoming) {
+    var existing = existingById[incoming.id] || null;
+    var previousHash = existing ? existing.contentHash : null;
+
+    var changeStatus;
+    if (incoming.forcedChangeStatus === 'missing') {
+      changeStatus = 'missing';
+    } else if (incoming.forcedChangeStatus === 'resolved') {
+      changeStatus = existing ? 'resolved' : 'new';
+    } else if (!existing) {
+      changeStatus = 'new';
+    } else if (!existing.contentHash || existing.contentHash === incoming.contentHash) {
+      changeStatus = 'unchanged';
+    } else {
+      changeStatus = 'updated';
+    }
+
+    var isRepeatedMissing = changeStatus === 'missing' && existing && existing.changeStatus === 'missing';
+
+    if (changeStatus === 'new') stats.addedCount++;
+    else if (changeStatus === 'unchanged') stats.unchangedCount++;
+    else if (changeStatus === 'resolved') stats.resolvedCount++;
+    else if (changeStatus === 'missing') stats.missingCount++;
+    else stats.updatedCount++;
+
+    var isFirstTimeEvent =
+      changeStatus === 'updated' || changeStatus === 'resolved' || (changeStatus === 'missing' && !isRepeatedMissing);
+
+    if (isFirstTimeEvent) {
+      historyEntries.push({
+        itemId: incoming.id,
+        sourceId: sourceId,
+        detectedAt: nowIso,
+        previousHash: previousHash,
+        newHash: incoming.contentHash,
+        previousSummary: existing ? existing.summary : '',
+        newSummary: incoming.summary,
+        diffNote:
+          changeStatus === 'resolved'
+            ? '状態解消（Excelで通常出荷への復帰を確認）'
+            : changeStatus === 'missing'
+              ? '今回の取得で掲載が確認できませんでした（供給再開とは判定せず、要手動確認）'
+              : '内容変更を検知',
+      });
+    }
+
+    var mergedState;
+    if (isRepeatedMissing) {
+      // 2回目以降の連続欠落：確認状態・再確認フラグは前回のまま変えない
+      mergedState = decideMergedState_(existing, 'unchanged');
+    } else if (changeStatus === 'missing') {
+      // 初めての欠落検知：内容変更(updated)と同じ扱いで再確認を促す
+      mergedState = decideMergedState_(existing, 'updated');
+    } else {
+      mergedState = decideMergedState_(existing, changeStatus);
+    }
+
+    var missingStreak =
+      changeStatus === 'missing' ? (existing && existing.missingStreak ? existing.missingStreak : 0) + 1 : 0;
+
+    updatedById[incoming.id] = {
+      id: incoming.id,
+      sourceId: sourceId,
+      sourceRecordId: incoming.sourceRecordId,
+      category: incoming.category,
+      itemType: incoming.itemType,
+      title: incoming.title,
+      summary: incoming.summary,
+      aiImportance: incoming.aiImportance,
+      publishedAt: incoming.publishedAt,
+      sourceName: incoming.sourceName,
+      documentNumber: incoming.documentNumber,
+      pharmacyImpact: incoming.pharmacyImpact,
+      requiredAction: incoming.requiredAction,
+      primaryUrl: incoming.primaryUrl,
+      remarks: incoming.remarks,
+      contentHash: incoming.contentHash,
+      previousContentHash: previousHash,
+      changeStatus: changeStatus,
+      missingStreak: missingStreak,
+      firstFetchedAt: existing ? existing.firstFetchedAt : incoming.fetchedAtIso,
+      lastFetchedAt: incoming.fetchedAtIso,
+      lastChangedAt:
+        changeStatus === 'unchanged' || isRepeatedMissing
+          ? existing
+            ? existing.lastChangedAt
+            : null
+          : incoming.fetchedAtIso,
+      reviewStatus: mergedState.reviewStatus,
+      confirmedImportance: mergedState.confirmedImportance,
+      importanceConfirmedBy: mergedState.importanceConfirmedBy,
+      importanceConfirmedAt: mergedState.importanceConfirmedAt,
+      homeDisplayConfirmed: mergedState.homeDisplayConfirmed,
+      homeDisplayConfirmedBy: mergedState.homeDisplayConfirmedBy,
+      homeDisplayConfirmedAt: mergedState.homeDisplayConfirmedAt,
+      homeDisplayNeedsReview: mergedState.homeDisplayNeedsReview,
+    };
+  });
+
+  return { updatedById: updatedById, historyEntries: historyEntries, stats: stats };
+}
+
+/**
+ * 複数の情報源の取得結果（成功／失敗まとめて）を、既存の全information_items状態
+ * （existingById、全情報源分）に適用する（純粋関数）。
+ *
+ *   ・成功した情報源だけ mergeSourceItems_ でマージする
+ *   ・失敗した情報源のexistingByIdの中身は一切変更しない（そのままコピーして残す）
+ *
+ * これが「一方の情報源が失敗しても他方（および失敗した側の既存情報）を
+ * 巻き込んで消さない」ための中心ロジック。
+ */
+function applyFetchResultsToState_(existingById, fetchResults, nowIso) {
+  var updatedById = {};
+  Object.keys(existingById).forEach(function (id) {
+    updatedById[id] = existingById[id];
+  });
+
+  var historyEntries = [];
+  var runLogs = [];
+
+  fetchResults.forEach(function (result) {
+    if (!result.success) {
+      runLogs.push({
+        sourceId: result.sourceId,
+        startedAt: result.startedAt || nowIso,
+        finishedAt: nowIso,
+        success: false,
+        fetchedCount: 0,
+        addedCount: 0,
+        updatedCount: 0,
+        unchangedCount: 0,
+        resolvedCount: 0,
+        missingCount: 0,
+        errorMessage: result.error || '不明なエラー',
+      });
+      return; // 失敗：既存データには一切触れない
+    }
+
+    var existingForSource = {};
+    Object.keys(existingById).forEach(function (id) {
+      if (existingById[id].sourceId === result.sourceId) {
+        existingForSource[id] = existingById[id];
+      }
+    });
+
+    var merged = mergeSourceItems_(result.sourceId, result.items, existingForSource, nowIso);
+
+    Object.keys(merged.updatedById).forEach(function (id) {
+      updatedById[id] = merged.updatedById[id];
+    });
+    historyEntries = historyEntries.concat(merged.historyEntries);
+
+    runLogs.push({
+      sourceId: result.sourceId,
+      startedAt: result.startedAt || nowIso,
+      finishedAt: nowIso,
+      success: true,
+      fetchedCount: result.items.length,
+      addedCount: merged.stats.addedCount,
+      updatedCount: merged.stats.updatedCount,
+      unchangedCount: merged.stats.unchangedCount,
+      resolvedCount: merged.stats.resolvedCount,
+      missingCount: merged.stats.missingCount,
+      errorMessage: null,
+    });
+  });
+
+  return { updatedById: updatedById, historyEntries: historyEntries, runLogs: runLogs };
+}
+
+/** itemType（'回収' / '供給' 等）から、リンクの見出しに使うラベルを決める。 */
+function linkLabelForItemType_(itemType) {
+  if (itemType === '供給') return '厚労省 医療用医薬品供給状況（Excel原本）';
+  return 'PMDA 回収情報一覧（原文）';
+}
+
+/**
+ * シートから読んだ「日時」の値をISO文字列に揃える。
  * Google Sheetsは日時っぽい文字列を自動でDate型に変換してしまうことがあるため、
  * Date型・文字列どちらで来ても同じ形式に正規化する。
  */
@@ -585,192 +916,715 @@ function normalizeFetchedAtValue_(value) {
   return String(value);
 }
 
-/**
- * 「情報アイテム変換結果」シートの列数（id〜homeDisplayConfirmedAtまで）。
- * doGet・doPost・writeInformationItemsToSheet_ で共通して使う。
- */
-var INFO_ITEMS_COLUMN_COUNT = 21;
+/* ============================================================
+ * セクションB：スプレッドシート・ネットワークアクセスを伴う実処理
+ * ============================================================ */
 
-function writeInformationItemsToSheet_(items) {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName(INFO_ITEMS_SHEET_NAME);
+var INFO_ITEMS_SHEET_NAME = 'information_items';
+var INFO_ITEMS_HEADER_ = [
+  'id',
+  'sourceId',
+  'sourceRecordId',
+  'category',
+  'itemType',
+  'title',
+  'summary',
+  'aiImportance',
+  'reviewStatus',
+  'publishedAt',
+  'sourceName',
+  'documentNumber',
+  'pharmacyImpact',
+  'requiredAction',
+  'primaryUrl',
+  'remarks',
+  'contentHash',
+  'previousContentHash',
+  'changeStatus',
+  'firstFetchedAt',
+  'lastFetchedAt',
+  'lastChangedAt',
+  'confirmedImportance',
+  'importanceConfirmedBy',
+  'importanceConfirmedAt',
+  'homeDisplayConfirmed',
+  'homeDisplayConfirmedBy',
+  'homeDisplayConfirmedAt',
+  'homeDisplayNeedsReview',
+  'missingStreak',
+];
+var INFO_ITEMS_COLUMN_COUNT = INFO_ITEMS_HEADER_.length; // 30
 
-  // 既存シートがあれば、idごとの「これまでの取得日時」と「人間が入力した確認状態」を
-  // 先に読み取っておく。CSV/Excelを再取得するたびに毎回シートを作り直す関係で、
-  // これをしないと「本日の取得」バグの再発だけでなく、せっかく確認・確定した内容や
-  // HOME表示設定まで再取得のたびに消えてしまう。
-  var previousStateById = {};
-  if (sheet) {
-    var existingLastRow = sheet.getLastRow();
-    if (existingLastRow >= 2) {
-      var existingValues = sheet.getRange(2, 1, existingLastRow - 1, INFO_ITEMS_COLUMN_COUNT).getValues();
-      for (var i = 0; i < existingValues.length; i++) {
-        var row = existingValues[i];
-        var existingId = row[0];
-        if (!existingId) continue;
-        previousStateById[existingId] = {
-          fetchedAt: normalizeFetchedAtValue_(row[14]),
-          reviewStatus: row[6] || null,
-          confirmedImportance: row[15] || null,
-          importanceConfirmedBy: row[16] || null,
-          importanceConfirmedAt: normalizeFetchedAtValue_(row[17]),
-          homeDisplayConfirmed: row[18] === true || row[18] === 'TRUE',
-          homeDisplayConfirmedBy: row[19] || null,
-          homeDisplayConfirmedAt: normalizeFetchedAtValue_(row[20]),
-        };
-      }
-    }
-    ss.deleteSheet(sheet); // 変換結果は毎回作り直す（列の並びやCSVの内容が変わっても対応しやすいように）
-  }
-  sheet = ss.insertSheet(INFO_ITEMS_SHEET_NAME);
+var HISTORY_SHEET_NAME_ = 'information_item_history';
+var HISTORY_HEADER_ = [
+  'itemId',
+  'sourceId',
+  'detectedAt',
+  'previousHash',
+  'newHash',
+  'previousSummary',
+  'newSummary',
+  'diffNote',
+];
 
-  var header = [
-    'id', 'category', 'itemType', 'title', 'summary', 'aiImportance',
-    'reviewStatus', 'publishedAt', 'sourceName', 'documentNumber',
-    'pharmacyImpact', 'requiredAction', '原資料URL', '備考(_remarks)', '取得日時',
-    'confirmedImportance', 'importanceConfirmedBy', 'importanceConfirmedAt',
-    'homeDisplayConfirmed', 'homeDisplayConfirmedBy', 'homeDisplayConfirmedAt',
-  ];
+var RUN_LOG_SHEET_NAME_ = 'source_run_logs';
+var RUN_LOG_HEADER_ = [
+  'sourceId',
+  'startedAt',
+  'finishedAt',
+  'success',
+  'fetchedCount',
+  'addedCount',
+  'updatedCount',
+  'unchangedCount',
+  'resolvedCount',
+  'missingCount',
+  'errorMessage',
+];
 
-  // 1行ずつappendRowするとAPI呼び出しが件数分発生し、数百〜数千件になると
-  // 実行時間の上限（6分）を超えてタイムアウトする。まとめて配列を作ってから
-  // 1回のsetValuesで書き込む（数千件でも数秒で終わる）。
-  var rows = items.map(function (item) {
-    var prev = previousStateById[item.id];
-    var fetchedAt = (prev && prev.fetchedAt) || item.fetchedAt;
-    // 確認状態・重要度確定・HOME表示は、既に見たことのあるidなら前回の値をそのまま引き継ぐ。
-    // 新規のidだけ、変換直後の初期値（未確認・未確定）を使う。
-    var reviewStatus = prev ? prev.reviewStatus : item.reviewStatus;
-    var confirmedImportance = prev ? prev.confirmedImportance : null;
-    var importanceConfirmedBy = prev ? prev.importanceConfirmedBy : null;
-    var importanceConfirmedAt = prev ? prev.importanceConfirmedAt : null;
-    var homeDisplayConfirmed = prev ? prev.homeDisplayConfirmed : false;
-    var homeDisplayConfirmedBy = prev ? prev.homeDisplayConfirmedBy : null;
-    var homeDisplayConfirmedAt = prev ? prev.homeDisplayConfirmedAt : null;
+var SOURCE_LABELS_ = { pmda_recall: 'PMDA回収情報', mhlw_supply: '厚労省供給情報' };
 
-    return [
-      item.id,
-      item.category,
-      item.itemType,
-      item.title,
-      item.summary,
-      item.aiImportance,
-      reviewStatus,
-      item.publishedAt,
-      item.sourceName,
-      item.documentNumber,
-      item.pharmacyImpact,
-      item.requiredAction,
-      item.links[0].url,
-      item._remarks,
-      fetchedAt,
-      confirmedImportance,
-      importanceConfirmedBy,
-      importanceConfirmedAt,
-      homeDisplayConfirmed,
-      homeDisplayConfirmedBy,
-      homeDisplayConfirmedAt,
-    ];
-  });
+// 旧バージョン（v2）が使っていた「情報アイテム変換結果」シート関連
+var LEGACY_SHEET_NAME_ = '情報アイテム変換結果';
+var LEGACY_BACKUP_SHEET_NAME_ = '旧_情報アイテム変換結果';
+var LEGACY_COLUMN_COUNT_ = 21;
+var LEGACY_MIGRATION_FLAG_KEY_ = 'LEGACY_MIGRATION_DONE_V3';
 
-  sheet.getRange(1, 1, 1, header.length).setValues([header]);
-  sheet.setFrozenRows(1);
-  if (rows.length > 0) {
-    sheet.getRange(2, 1, rows.length, header.length).setValues(rows);
-  }
-
-  Logger.log(INFO_ITEMS_SHEET_NAME + ' シートに ' + items.length + ' 件書き込みました。');
+/** シートの1行（配列）を、readExistingItemsById_ / migrateLegacySheetIfNeeded_ 共通の状態オブジェクトへ変換する。 */
+function rowToItemState_(row) {
+  return {
+    id: row[0],
+    sourceId: row[1],
+    sourceRecordId: row[2],
+    category: row[3],
+    itemType: row[4],
+    title: row[5],
+    summary: row[6],
+    aiImportance: row[7],
+    reviewStatus: row[8],
+    publishedAt: row[9],
+    sourceName: row[10],
+    documentNumber: row[11],
+    pharmacyImpact: row[12],
+    requiredAction: row[13],
+    primaryUrl: row[14],
+    remarks: row[15],
+    contentHash: row[16] || null,
+    previousContentHash: row[17] || null,
+    changeStatus: row[18] || 'unchanged',
+    firstFetchedAt: normalizeFetchedAtValue_(row[19]),
+    lastFetchedAt: normalizeFetchedAtValue_(row[20]),
+    lastChangedAt: normalizeFetchedAtValue_(row[21]),
+    confirmedImportance: row[22] || null,
+    importanceConfirmedBy: row[23] || null,
+    importanceConfirmedAt: normalizeFetchedAtValue_(row[24]),
+    homeDisplayConfirmed: row[25] === true || row[25] === 'TRUE',
+    homeDisplayConfirmedBy: row[26] || null,
+    homeDisplayConfirmedAt: normalizeFetchedAtValue_(row[27]),
+    homeDisplayNeedsReview: row[28] === true || row[28] === 'TRUE',
+    missingStreak: Number(row[29]) || 0,
+  };
 }
 
-/* ============================================================
- * Web App化：外部（medical-info-watchアプリ）からJSONで読めるようにする
- * ============================================================
- * デプロイ手順：
- *   1. 右上「デプロイ」→「新しいデプロイ」
- *   2. 種類の選択（歯車アイコン）→「ウェブアプリ」
- *   3. 「次のユーザーとして実行」→ 自分
- *      「アクセスできるユーザー」→ 全員
- *   4. 「デプロイ」→ 権限の承認 → 発行されたURLをコピー
- *   5. そのURLをブラウザで直接開くと、JSONがそのまま表示されれば成功
- *
- * 注意：このURLは「情報アイテム変換結果」シートの中身をそのまま返す。
- * 新しいデータにしたい場合は、先に runConvertAllToInformationItems
- *（PMDA回収情報＋厚労省供給状況の両方をまとめて取得）を実行してシートを更新してから、
- * このURLを開き直す（自動更新ではない）。
- */
-function doGet(e) {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName(INFO_ITEMS_SHEET_NAME);
+/** 旧「情報アイテム変換結果」シートから新しい`information_items`シートへ、初回だけ移行する。 */
+function migrateLegacySheetIfNeeded_() {
+  var props = PropertiesService.getScriptProperties();
+  if (props.getProperty(LEGACY_MIGRATION_FLAG_KEY_) === 'done') return;
 
-  if (!sheet) {
-    return jsonResponse_({
-      error: '「情報アイテム変換結果」シートがありません。先に runConvertPmdaRecallToInformationItems を実行してください。',
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var legacySheet = ss.getSheetByName(LEGACY_SHEET_NAME_);
+  var newSheet = ss.getSheetByName(INFO_ITEMS_SHEET_NAME);
+
+  if (!legacySheet || newSheet) {
+    // 旧シートが無い（新規導入）、または新シートが既にある（移行済みだがフラグ未設定）場合はスキップ。
+    props.setProperty(LEGACY_MIGRATION_FLAG_KEY_, 'done');
+    return;
+  }
+
+  var lastRow = legacySheet.getLastRow();
+  var migratedById = {};
+
+  if (lastRow >= 2) {
+    var values = legacySheet.getRange(2, 1, lastRow - 1, LEGACY_COLUMN_COUNT_).getValues();
+    values.forEach(function (row) {
+      var id = row[0];
+      if (!id) return;
+      var idStr = String(id);
+      var sourceId =
+        idStr.indexOf('pmda_recall_') === 0 ? 'pmda_recall' : idStr.indexOf('mhlw_supply_') === 0 ? 'mhlw_supply' : 'unknown';
+      var sourceRecordId = idStr.replace(/^(pmda_recall_|mhlw_supply_)/, '');
+      var fetchedAtIso = normalizeFetchedAtValue_(row[14]) || new Date().toISOString();
+
+      migratedById[id] = {
+        id: id,
+        sourceId: sourceId,
+        sourceRecordId: sourceRecordId,
+        category: row[1] || 'pharmacy',
+        itemType: row[2] || '',
+        title: row[3] || '',
+        summary: row[4] || '',
+        aiImportance: row[5] || 'info',
+        reviewStatus: row[6] || 'unreviewed',
+        publishedAt: row[7] || '',
+        sourceName: row[8] || '',
+        documentNumber: row[9] || null,
+        pharmacyImpact: row[10] || '',
+        requiredAction: row[11] || null,
+        primaryUrl: row[12] || '',
+        remarks: row[13] || '',
+        // 移行直後はハッシュ未計算（null）。mergeSourceItems_の仕様により、
+        // 次回取得時は「unchanged」として扱われ、確認状態は失われない。
+        contentHash: null,
+        previousContentHash: null,
+        changeStatus: 'unchanged',
+        firstFetchedAt: fetchedAtIso,
+        lastFetchedAt: fetchedAtIso,
+        lastChangedAt: null,
+        confirmedImportance: row[15] || null,
+        importanceConfirmedBy: row[16] || null,
+        importanceConfirmedAt: normalizeFetchedAtValue_(row[17]),
+        homeDisplayConfirmed: row[18] === true || row[18] === 'TRUE',
+        homeDisplayConfirmedBy: row[19] || null,
+        homeDisplayConfirmedAt: normalizeFetchedAtValue_(row[20]),
+        homeDisplayNeedsReview: false,
+        missingStreak: 0,
+      };
     });
   }
 
-  var lastRow = sheet.getLastRow();
-  if (lastRow < 2) {
-    return jsonResponse_({ items: [], watchSettings: getWatchSettings_() });
-  }
-
-  var values = sheet.getRange(2, 1, lastRow - 1, INFO_ITEMS_COLUMN_COUNT).getValues();
-  var now = new Date().toISOString();
-
-  var items = values.map(function (row) {
-    // row[14]（取得日時）は、このidを最初に発見した時点の日時
-    // （writeInformationItemsToSheet_が過去の値を引き継いでいる）。
-    // このカラムが無かった古いシートの名残でnull/空になっている場合だけ、
-    // フォールバックとして今の時刻を使う。
-    var fetchedAtIso = normalizeFetchedAtValue_(row[14]) || now;
-
-    return {
-      id: row[0],
-      category: row[1],
-      itemType: row[2],
-      title: row[3],
-      summary: row[4],
-      aiImportance: row[5],
-      confirmedImportance: row[15] || null,
-      importanceConfirmedBy: row[16] || null,
-      importanceConfirmedAt: normalizeFetchedAtValue_(row[17]),
-      reviewStatus: row[6] || 'unreviewed',
-      publishedAt: row[7],
-      fetchedAt: fetchedAtIso,
-      sourceName: row[8],
-      documentNumber: row[9],
-      pharmacyImpact: row[10],
-      requiredAction: row[11] || null,
-      actionDeadline: null,
-      homeDisplayConfirmed: row[18] === true || row[18] === 'TRUE',
-      homeDisplayConfirmedBy: row[19] || null,
-      homeDisplayConfirmedAt: normalizeFetchedAtValue_(row[20]),
-      links: row[12]
-        ? [{ label: linkLabelForItemType_(row[2]), url: row[12], kind: 'primary' }]
-        : [],
-    };
-  });
-
-  return jsonResponse_({ items: items, generatedAt: now, watchSettings: getWatchSettings_() });
+  writeInformationItemsSheet_(migratedById);
+  legacySheet.setName(LEGACY_BACKUP_SHEET_NAME_);
+  props.setProperty(LEGACY_MIGRATION_FLAG_KEY_, 'done');
+  Logger.log(
+    '旧シートから ' +
+      Object.keys(migratedById).length +
+      ' 件を ' +
+      INFO_ITEMS_SHEET_NAME +
+      ' へ移行しました（旧シートは「' +
+      LEGACY_BACKUP_SHEET_NAME_ +
+      '」として保持しています。削除はしていません）。',
+  );
 }
 
-/** itemType（'回収' / '供給' 等）から、リンクの見出しに使うラベルを決める。 */
-function linkLabelForItemType_(itemType) {
-  if (itemType === '供給') return '厚労省 医療用医薬品供給状況（Excel原本）';
-  return 'PMDA 回収情報一覧（原文）';
+/** `information_items`シートの現在の内容を、id をキーにしたオブジェクトとして読み込む。 */
+function readExistingItemsById_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(INFO_ITEMS_SHEET_NAME);
+  var result = {};
+  if (!sheet) return result;
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return result;
+  var values = sheet.getRange(2, 1, lastRow - 1, INFO_ITEMS_COLUMN_COUNT).getValues();
+  values.forEach(function (row) {
+    var id = row[0];
+    if (!id) return;
+    result[id] = rowToItemState_(row);
+  });
+  return result;
+}
+
+/**
+ * マージ済みの状態（byId）を`information_items`シートへ書き込む。
+ * 注意：シートの削除・作り直し（deleteSheet/insertSheet）はしない。
+ * byIdは常に「これまでの全idを含むスーパーセット」である前提（applyFetchResultsToState_が保証する）
+ * ため、ここでの一括setValuesは「削除して作り直す」のではなく「現在状態を丸ごと書き戻す」動作になる。
+ */
+function writeInformationItemsSheet_(byId) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(INFO_ITEMS_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(INFO_ITEMS_SHEET_NAME);
+  }
+  if (sheet.getLastRow() === 0) {
+    sheet.setFrozenRows(1);
+  }
+  // 見出し行は毎回書き直す（列を追加した際に、既存シートの見出しが古いまま
+  // 残ってしまわないようにするため。冪等な操作なので毎回実行しても害はない）。
+  sheet.getRange(1, 1, 1, INFO_ITEMS_HEADER_.length).setValues([INFO_ITEMS_HEADER_]);
+
+  var ids = Object.keys(byId).sort();
+  var rows = ids.map(function (id) {
+    var it = byId[id];
+    return [
+      it.id,
+      it.sourceId,
+      it.sourceRecordId,
+      it.category,
+      it.itemType,
+      it.title,
+      it.summary,
+      it.aiImportance,
+      it.reviewStatus,
+      it.publishedAt,
+      it.sourceName,
+      it.documentNumber,
+      it.pharmacyImpact,
+      it.requiredAction,
+      it.primaryUrl,
+      it.remarks,
+      it.contentHash,
+      it.previousContentHash,
+      it.changeStatus,
+      it.firstFetchedAt,
+      it.lastFetchedAt,
+      it.lastChangedAt,
+      it.confirmedImportance,
+      it.importanceConfirmedBy,
+      it.importanceConfirmedAt,
+      it.homeDisplayConfirmed,
+      it.homeDisplayConfirmedBy,
+      it.homeDisplayConfirmedAt,
+      it.homeDisplayNeedsReview,
+      it.missingStreak || 0,
+    ];
+  });
+
+  if (rows.length > 0) {
+    sheet.getRange(2, 1, rows.length, INFO_ITEMS_COLUMN_COUNT).setValues(rows);
+  }
+
+  // 件数が減った場合（通常は減らない想定だが、念のため）、余った古い行の中身だけ消す。
+  var lastRow = sheet.getLastRow();
+  var expectedLastRow = rows.length + 1;
+  if (lastRow > expectedLastRow) {
+    sheet.getRange(expectedLastRow + 1, 1, lastRow - expectedLastRow, INFO_ITEMS_COLUMN_COUNT).clearContent();
+  }
+}
+
+function appendHistoryEntries_(entries) {
+  if (!entries || entries.length === 0) return;
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(HISTORY_SHEET_NAME_);
+  if (!sheet) {
+    sheet = ss.insertSheet(HISTORY_SHEET_NAME_);
+    sheet.appendRow(HISTORY_HEADER_);
+    sheet.setFrozenRows(1);
+  }
+  var rows = entries.map(function (e) {
+    return [e.itemId, e.sourceId, e.detectedAt, e.previousHash, e.newHash, e.previousSummary, e.newSummary, e.diffNote];
+  });
+  sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, HISTORY_HEADER_.length).setValues(rows);
+}
+
+function appendRunLogs_(logs) {
+  if (!logs || logs.length === 0) return;
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(RUN_LOG_SHEET_NAME_);
+  if (!sheet) {
+    sheet = ss.insertSheet(RUN_LOG_SHEET_NAME_);
+    sheet.setFrozenRows(1);
+  }
+  // information_itemsと同様、見出し行は列追加に備えて毎回書き直す。
+  sheet.getRange(1, 1, 1, RUN_LOG_HEADER_.length).setValues([RUN_LOG_HEADER_]);
+  var rows = logs.map(function (l) {
+    return [
+      l.sourceId,
+      l.startedAt,
+      l.finishedAt,
+      l.success,
+      l.fetchedCount,
+      l.addedCount,
+      l.updatedCount,
+      l.unchangedCount,
+      l.resolvedCount,
+      l.missingCount,
+      l.errorMessage,
+    ];
+  });
+  sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, RUN_LOG_HEADER_.length).setValues(rows);
+}
+
+/** 情報源ごとの最新の実行結果・最新の成功結果を返す（画面の「情報源ごとの取得状況」表示用）。 */
+function getLatestSourceRunStatuses_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(RUN_LOG_SHEET_NAME_);
+  if (!sheet) return [];
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return [];
+  var values = sheet.getRange(2, 1, lastRow - 1, RUN_LOG_HEADER_.length).getValues();
+
+  var latestBySource = {};
+  var latestSuccessBySource = {};
+  values.forEach(function (row) {
+    var sourceId = row[0];
+    var entry = {
+      sourceId: sourceId,
+      startedAt: row[1],
+      finishedAt: row[2],
+      success: row[3] === true || row[3] === 'TRUE',
+      fetchedCount: row[4],
+      addedCount: row[5],
+      updatedCount: row[6],
+      unchangedCount: row[7],
+      resolvedCount: row[8],
+      missingCount: row[9],
+      errorMessage: row[10] || null,
+    };
+    latestBySource[sourceId] = entry; // 後の行ほど新しいので、最後まで見た結果が最新
+    if (entry.success) latestSuccessBySource[sourceId] = entry;
+  });
+
+  return Object.keys(latestBySource).map(function (sourceId) {
+    var latest = latestBySource[sourceId];
+    var latestSuccess = latestSuccessBySource[sourceId];
+    return {
+      sourceId: sourceId,
+      label: SOURCE_LABELS_[sourceId] || sourceId,
+      lastRunAt: latest.finishedAt,
+      success: latest.success,
+      fetchedCount: latest.success ? latest.fetchedCount : latestSuccess ? latestSuccess.fetchedCount : 0,
+      lastSuccessAt: latestSuccess ? latestSuccess.finishedAt : null,
+      errorMessage: latest.success ? null : latest.errorMessage,
+    };
+  });
+}
+
+// ---- PMDA回収情報：ネットワーク取得（GAS依存） ----
+
+/**
+ * CSVを取得し、UTF-8として解釈したうえでGAS標準のCSVパーサで配列に変換する。
+ * 先頭のBOM（文字化けの原因になりがちな不可視文字）も取り除く。
+ */
+function fetchAndParseCsv_(url) {
+  try {
+    var response = UrlFetchApp.fetch(url, {
+      muteHttpExceptions: true,
+      followRedirects: true,
+    });
+    var code = response.getResponseCode();
+    if (code !== 200) {
+      Logger.log('HTTPステータスが200以外: ' + code);
+      return null;
+    }
+
+    var text = response.getContentText('UTF-8');
+    if (text.charCodeAt(0) === 0xfeff) {
+      text = text.substring(1);
+    }
+
+    var table = Utilities.parseCsv(text);
+    if (!table || table.length < 2) {
+      Logger.log('CSVの行数が想定より少ない');
+      return [];
+    }
+
+    var header = table[0];
+    if (header.length !== CSV_COLUMNS.length) {
+      Logger.log(
+        '警告：見出しの列数が想定(' + CSV_COLUMNS.length + ')と異なる(' + header.length + ')。PMDA側でCSVの形式が変わった可能性がある。',
+      );
+    }
+
+    return table.slice(1);
+  } catch (e) {
+    Logger.log('取得・解析中にエラー: ' + e);
+    return null;
+  }
+}
+
+/**
+ * PMDA回収情報を取得し、{ sourceId, success, items, fetchedAt, error } の形で返す。
+ * 「取得成功で0件」と「通信・解析失敗」を明確に区別する
+ * （fetchAndParseCsv_がnullを返す＝失敗、空配列を返す＝成功で0件）。
+ */
+function fetchPmdaRecallSourceResult_() {
+  var startedAt = new Date().toISOString();
+  var candidates = pmdaFiscalYearCandidates_(new Date());
+  var rows = null;
+  var usedUrl = null;
+  var lastError = null;
+
+  for (var i = 0; i < candidates.length; i++) {
+    var c = candidates[i];
+    var url = 'https://www.info.pmda.go.jp/kaisyuu/rcidx' + c.fiscalYear2Digit + '-' + c.recallClass + 'm.csv';
+    var result = fetchAndParseCsv_(url);
+    if (result === null) {
+      lastError = url + ' の取得または解析に失敗しました';
+      continue;
+    }
+    if (result.length > 0) {
+      rows = result;
+      usedUrl = url;
+      break;
+    }
+    // 0件だった場合（年度切替直後など）は次の候補を試す
+    rows = result;
+    usedUrl = url;
+  }
+
+  var fetchedAtIso = new Date().toISOString();
+
+  if (rows === null) {
+    return {
+      sourceId: 'pmda_recall',
+      success: false,
+      items: [],
+      fetchedAt: fetchedAtIso,
+      startedAt: startedAt,
+      error: lastError || 'PMDA回収情報の取得に失敗しました（候補年度すべて）',
+    };
+  }
+
+  var listPageUrl = usedUrl.replace('.csv', '.html');
+  var items = buildPmdaIncomingItems_(rows, listPageUrl, fetchedAtIso);
+
+  return { sourceId: 'pmda_recall', success: true, items: items, fetchedAt: fetchedAtIso, startedAt: startedAt, error: null };
+}
+
+// ---- 厚労省供給状況：ネットワーク取得（GAS依存） ----
+
+var MHLW_SUPPLY_PAGE_URL =
+  'https://www.mhlw.go.jp/stf/seisakunitsuite/bunya/kenkou_iryou/iryou/kouhatu-iyaku/04_00003.html';
+
+/** 供給状況ページを開いて、その時点の最新Excelファイルへのリンクを探す。 */
+function findLatestMhlwSupplyXlsxUrl_() {
+  var response = UrlFetchApp.fetch(MHLW_SUPPLY_PAGE_URL, { muteHttpExceptions: true });
+  if (response.getResponseCode() !== 200) {
+    Logger.log('供給状況ページの取得に失敗: HTTP ' + response.getResponseCode());
+    return null;
+  }
+  var html = response.getContentText('UTF-8');
+  var match = html.match(/(?:https:\/\/www\.mhlw\.go\.jp)?\/content\/10800000\/\d{6}iyakuhinkyoukyu\.xlsx/);
+  if (!match) {
+    Logger.log('供給状況ページ内にExcelファイルへのリンクが見つかりませんでした（ページ構成が変わった可能性）。');
+    return null;
+  }
+  var found = match[0];
+  return found.indexOf('http') === 0 ? found : 'https://www.mhlw.go.jp' + found;
+}
+
+/**
+ * 供給状況Excelを取得し、Googleスプレッドシートに変換してから中身を配列で返す。
+ * 変換用に作った一時ファイルは読み終わったら削除する。
+ */
+function fetchMhlwSupplyRawTable_() {
+  var xlsxUrl = findLatestMhlwSupplyXlsxUrl_();
+  if (!xlsxUrl) return null;
+
+  Logger.log('供給状況Excel取得先: ' + xlsxUrl);
+  var xlsxResponse = UrlFetchApp.fetch(xlsxUrl, { muteHttpExceptions: true });
+  if (xlsxResponse.getResponseCode() !== 200) {
+    Logger.log('Excelファイルの取得に失敗: HTTP ' + xlsxResponse.getResponseCode());
+    return null;
+  }
+
+  var blob = xlsxResponse.getBlob();
+  var tempFileId = null;
+  try {
+    var tempFile = Drive.Files.create(
+      { name: '_一時_供給状況変換用_' + new Date().getTime(), mimeType: MimeType.GOOGLE_SHEETS },
+      blob,
+    );
+    tempFileId = tempFile.id;
+
+    var tempSpreadsheet = SpreadsheetApp.openById(tempFileId);
+    var sheet = tempSpreadsheet.getSheets()[0];
+    var values = sheet.getDataRange().getValues();
+    return { values: values, sourceUrl: xlsxUrl };
+  } catch (e) {
+    Logger.log('Excel変換・読み込み中にエラー: ' + e + '（「サービス」にDrive APIを追加し忘れていないか確認してください）');
+    return null;
+  } finally {
+    if (tempFileId) {
+      try {
+        Drive.Files.remove(tempFileId);
+      } catch (e2) {
+        Logger.log('一時ファイルの削除に失敗（Driveに残っている可能性、手動で削除してください）: ' + e2);
+      }
+    }
+  }
+}
+
+/**
+ * 供給状況Excelを取得し、YJコードごとの現在状態（currentByYjCode）を返す。
+ * この段階では「限定出荷・供給停止だけに絞り込む」処理はしない（全件保持する）。
+ * 絞り込み・解消判定はbuildMhlwSupplyIncomingItems_（純粋関数）が行う。
+ */
+function fetchMhlwSupplySourceRawData_() {
+  var startedAt = new Date().toISOString();
+  var table = fetchMhlwSupplyRawTable_();
+  if (!table) {
+    return { success: false, error: '供給状況ページまたはExcelの取得に失敗しました', startedAt: startedAt };
+  }
+
+  var values = table.values;
+  var headerRowIndex = findMhlwSupplyHeaderRowIndex_(values);
+  if (headerRowIndex === -1) {
+    return { success: false, error: '見出し行（「出荷対応」を含む行）が見つかりませんでした', startedAt: startedAt };
+  }
+
+  var idx = findMhlwSupplyColumnIndices_(values[headerRowIndex]);
+  if (idx.shippingStatus === undefined) {
+    return { success: false, error: '「出荷対応」列の位置が特定できませんでした', startedAt: startedAt };
+  }
+
+  var currentByYjCode = {};
+  for (var r = headerRowIndex + 1; r < values.length; r++) {
+    var row = values[r];
+    var yjCode = idx.yjCode !== undefined ? String(row[idx.yjCode] || '').trim() : '';
+    if (!yjCode) continue;
+    var status = idx.shippingStatus !== undefined ? String(row[idx.shippingStatus] || '').trim() : '';
+    currentByYjCode[yjCode] = {
+      status: status,
+      fields: {
+        productName: idx.productName !== undefined ? String(row[idx.productName] || '').trim() : '',
+        genericName: idx.genericName !== undefined ? String(row[idx.genericName] || '').trim() : '',
+        manufacturer: idx.manufacturer !== undefined ? String(row[idx.manufacturer] || '').trim() : '',
+        volume: idx.shippingVolume !== undefined ? String(row[idx.shippingVolume] || '').trim() : '',
+        reason: idx.reason !== undefined ? String(row[idx.reason] || '').trim() : '',
+        startDate: idx.startDate !== undefined ? formatMhlwDateCell_(row[idx.startDate]) : '',
+        resolution: idx.resolution !== undefined ? formatMhlwDateCell_(row[idx.resolution]) : '',
+      },
+    };
+  }
+
+  return { success: true, currentByYjCode: currentByYjCode, sourceUrl: table.sourceUrl, startedAt: startedAt };
+}
+
+/**
+ * 厚労省供給状況を取得し、{ sourceId, success, items, fetchedAt, error } の形で返す。
+ * existingMhlwSourceRecordIds（現在追跡中のYJコード一覧）を渡すことで、
+ * 供給再開（解消）の判定に使う。
+ */
+function fetchMhlwSupplySourceResult_(existingMhlwStates) {
+  var raw = fetchMhlwSupplySourceRawData_();
+  var fetchedAtIso = new Date().toISOString();
+  if (!raw.success) {
+    return { sourceId: 'mhlw_supply', success: false, items: [], fetchedAt: fetchedAtIso, startedAt: raw.startedAt, error: raw.error };
+  }
+  var items = buildMhlwSupplyIncomingItems_(raw.currentByYjCode, existingMhlwStates, raw.sourceUrl, fetchedAtIso);
+  return { sourceId: 'mhlw_supply', success: true, items: items, fetchedAt: fetchedAtIso, startedAt: raw.startedAt, error: null };
+}
+
+/** existingByIdのうち、指定したsourceIdの分だけを sourceRecordId をキーにした形で取り出す。 */
+function pickStatesBySourceId_(existingById, sourceId) {
+  var result = {};
+  Object.keys(existingById).forEach(function (id) {
+    var state = existingById[id];
+    if (state.sourceId === sourceId) {
+      result[state.sourceRecordId] = state;
+    }
+  });
+  return result;
+}
+
+// ---- 実行エントリーポイント ----
+
+/**
+ * PMDA回収情報 と 厚労省供給状況 の両方を取得し、information_itemsへ安全にマージする。
+ * 毎朝の自動実行（トリガー）・手動実行の両方から呼ばれる。
+ *
+ * ロックの取り方（v3.1で見直し）：PMDA CSV・厚労省Excelの取得はネットワーク越しで
+ * 数秒〜十数秒かかることがあるため、その間ずっとロックを保持すると、その間に人間が
+ * 確認ボタンを押した操作がタイムアウトしやすくなる。そこで、
+ *   1. ロックを取らずに外部データを取得する（下準備として、取得前のexistingByIdも読んでおく）
+ *   2. シートの読み書きだけをロックで保護する。ロックを取った直後に existingById を
+ *      読み直すことで、取得中に人間が行った変更を取りこぼさない
+ * という2段階に分けている。
+ */
+function runConvertAllToInformationItems() {
+  migrateLegacySheetIfNeeded_();
+
+  var preFetchExistingById = readExistingItemsById_();
+  var existingMhlwStates = pickStatesBySourceId_(preFetchExistingById, 'mhlw_supply');
+
+  var pmdaResult = fetchPmdaRecallSourceResult_();
+  var mhlwResult = fetchMhlwSupplySourceResult_(existingMhlwStates);
+
+  var lock = LockService.getScriptLock();
+  var gotLock = false;
+  try {
+    gotLock = lock.tryLock(10000);
+  } catch (e) {
+    gotLock = false;
+  }
+  if (!gotLock) {
+    Logger.log(
+      'シート更新の直前で他の処理と競合したため、今回の取得結果は保存されませんでした（ロック取得失敗。次回の自動実行で再取得されます）。',
+    );
+    return;
+  }
+
+  try {
+    // ロックを取った直後に最新状態を読み直す（取得中に行われた人間の操作を取りこぼさないため）。
+    var existingById = readExistingItemsById_();
+    var nowIso = new Date().toISOString();
+    var applied = applyFetchResultsToState_(existingById, [pmdaResult, mhlwResult], nowIso);
+
+    writeInformationItemsSheet_(applied.updatedById);
+    appendHistoryEntries_(applied.historyEntries);
+    appendRunLogs_(applied.runLogs);
+
+    Logger.log(
+      'PMDA: ' +
+        (pmdaResult.success ? '成功(' + pmdaResult.items.length + '件)' : '失敗: ' + pmdaResult.error) +
+        ' / 厚労省供給: ' +
+        (mhlwResult.success ? '成功(' + mhlwResult.items.length + '件)' : '失敗: ' + mhlwResult.error),
+    );
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * 情報源を1つだけ取得してマージする共通処理（単体デバッグ実行用）。
+ * fetchResultsBuilderFn は「取得前のexistingById（ロック取得前の下準備用）」を受け取り、
+ * fetchResults配列を返す関数。ネットワーク取得はロックの外で行う。
+ */
+function runSingleSourceConversion_(fetchResultsBuilderFn) {
+  migrateLegacySheetIfNeeded_();
+  var preFetchExistingById = readExistingItemsById_();
+  var results = fetchResultsBuilderFn(preFetchExistingById);
+
+  var lock = LockService.getScriptLock();
+  var gotLock = false;
+  try {
+    gotLock = lock.tryLock(10000);
+  } catch (e) {
+    gotLock = false;
+  }
+  if (!gotLock) {
+    Logger.log('シート更新の直前で他の処理と競合したため、今回の取得結果は保存されませんでした（ロック取得失敗）。');
+    return;
+  }
+  try {
+    var existingById = readExistingItemsById_();
+    var nowIso = new Date().toISOString();
+    var applied = applyFetchResultsToState_(existingById, results, nowIso);
+    writeInformationItemsSheet_(applied.updatedById);
+    appendHistoryEntries_(applied.historyEntries);
+    appendRunLogs_(applied.runLogs);
+    Logger.log('単体実行完了: ' + JSON.stringify(applied.runLogs));
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** PMDA回収情報だけを取得してマージする（動作確認用の単体実行）。 */
+function runConvertPmdaRecallToInformationItems() {
+  runSingleSourceConversion_(function () {
+    return [fetchPmdaRecallSourceResult_()];
+  });
+}
+
+/** 厚労省供給状況だけを取得してマージする（動作確認用の単体実行）。 */
+function runConvertMhlwSupplyToInformationItems() {
+  runSingleSourceConversion_(function (preFetchExistingById) {
+    var existingMhlwStates = pickStatesBySourceId_(preFetchExistingById, 'mhlw_supply');
+    return [fetchMhlwSupplySourceResult_(existingMhlwStates)];
+  });
 }
 
 /* ============================================================
- * ここから：ウォッチ設定・確認状態の永続化
- * ============================================================
- * ウォッチ設定（薬局業務ウォッチのON/OFF・HOME表示等）は施設単位の設定なので、
- * スクリプトのプロパティ（PropertiesService）にJSONとして保存する。
- * 個々の情報の確認状態・重要度確定・HOME表示確定は、
- * 「情報アイテム変換結果」シートの該当行を直接更新する（doPost経由）。
- */
+ * セクションC：Web App化（doGet / doPost）
+ * ============================================================ */
+
+function jsonResponse_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
 
 var WATCH_SETTINGS_PROPERTY_KEY = 'WATCH_SETTINGS_JSON';
 
-/** 保存されているウォッチ設定を返す。未設定ならnull（アプリ側の初期値を使う）。 */
 function getWatchSettings_() {
   var stored = PropertiesService.getScriptProperties().getProperty(WATCH_SETTINGS_PROPERTY_KEY);
   if (!stored) return null;
@@ -787,109 +1641,211 @@ function saveWatchSettings_(settings) {
 }
 
 /**
+ * アプリからの読み込み。information_itemsシートの中身、ウォッチ設定、
+ * 情報源ごとの取得状況（sourceStatuses）をまとめて返す。
+ *
+ * 注意（現状のセキュリティレベル）：このWeb Appは「アクセスできるユーザー：全員」で
+ * 公開されているPoCです。読み取り専用のdoGetは実害が小さいためこのままにしていますが、
+ * URLを知っていれば誰でもこのデータを閲覧できる状態です。
+ */
+function doGet(e) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(INFO_ITEMS_SHEET_NAME);
+  var now = new Date().toISOString();
+
+  if (!sheet || sheet.getLastRow() < 2) {
+    return jsonResponse_({
+      items: [],
+      generatedAt: now,
+      watchSettings: getWatchSettings_(),
+      sourceStatuses: getLatestSourceRunStatuses_(),
+    });
+  }
+
+  var lastRow = sheet.getLastRow();
+  var values = sheet.getRange(2, 1, lastRow - 1, INFO_ITEMS_COLUMN_COUNT).getValues();
+
+  var items = values.map(function (row) {
+    var state = rowToItemState_(row);
+    return {
+      id: state.id,
+      sourceId: state.sourceId,
+      category: state.category,
+      itemType: state.itemType,
+      title: state.title,
+      summary: state.summary,
+      aiImportance: state.aiImportance,
+      confirmedImportance: state.confirmedImportance,
+      importanceConfirmedBy: state.importanceConfirmedBy,
+      importanceConfirmedAt: state.importanceConfirmedAt,
+      reviewStatus: state.reviewStatus,
+      publishedAt: state.publishedAt,
+      fetchedAt: state.firstFetchedAt || now,
+      lastFetchedAt: state.lastFetchedAt,
+      lastChangedAt: state.lastChangedAt,
+      changeStatus: state.changeStatus,
+      missingStreak: state.missingStreak,
+      sourceName: state.sourceName,
+      documentNumber: state.documentNumber,
+      pharmacyImpact: state.pharmacyImpact,
+      requiredAction: state.requiredAction,
+      actionDeadline: null,
+      homeDisplayConfirmed: state.homeDisplayConfirmed,
+      homeDisplayConfirmedBy: state.homeDisplayConfirmedBy,
+      homeDisplayConfirmedAt: state.homeDisplayConfirmedAt,
+      homeDisplayNeedsReview: state.homeDisplayNeedsReview,
+      links: state.primaryUrl ? [{ label: linkLabelForItemType_(state.itemType), url: state.primaryUrl, kind: 'primary' }] : [],
+      fetchError: null,
+    };
+  });
+
+  return jsonResponse_({
+    items: items,
+    generatedAt: now,
+    watchSettings: getWatchSettings_(),
+    sourceStatuses: getLatestSourceRunStatuses_(),
+  });
+}
+
+/**
  * アプリからの更新（内容確認・重要度確定・HOME表示確定・ウォッチ設定変更）を受け取る。
- * リクエストはContent-Type: text/plain で送られてくる想定（JSONにするとブラウザが
- * 送るプリフライト確認にGAS側のWeb Appが対応していないため失敗する）。中身はJSON文字列。
+ * LockServiceで排他制御し、内容はホワイトリスト方式で検証、業務ルールもサーバー側で強制する。
+ *
+ * 重要な注意（現状のセキュリティレベル）：入力値検証は追加したが、認証（本人確認）は
+ * まだ実装していない。URLを知っている人なら誰でもこのエンドポイントを呼び出せる。
+ * 本番運用の前には、認証付き中継バックエンドまたは共通ログイン基盤が必須の課題として残っている。
  */
 function doPost(e) {
+  var lock = LockService.getScriptLock();
+  var gotLock = false;
   try {
-    var body = JSON.parse(e.postData.contents);
+    gotLock = lock.tryLock(10000);
+  } catch (lockErr) {
+    gotLock = false;
+  }
+  if (!gotLock) {
+    return jsonResponse_({ ok: false, error: 'サーバーが混み合っています。少し待ってから再度お試しください（ロック取得失敗）。' });
+  }
+
+  try {
+    var body;
+    try {
+      body = JSON.parse(e.postData.contents);
+    } catch (parseErr) {
+      return jsonResponse_({ ok: false, error: 'リクエスト本文の解析に失敗しました' });
+    }
 
     if (body.action === 'updateItemStatus') {
-      updateItemStatusInSheet_(body);
-      return jsonResponse_({ ok: true });
+      return handleUpdateItemStatus_(body);
     }
-
     if (body.action === 'updateWatchSettings') {
-      saveWatchSettings_(body.settings);
-      return jsonResponse_({ ok: true });
+      return handleUpdateWatchSettings_(body);
     }
-
     return jsonResponse_({ ok: false, error: '不明なaction: ' + body.action });
   } catch (err) {
     Logger.log('doPost処理中にエラー: ' + err);
     return jsonResponse_({ ok: false, error: String(err) });
+  } finally {
+    lock.releaseLock();
   }
 }
 
-/**
- * 「情報アイテム変換結果」シートの、指定idの行を1件だけ更新する。
- * body には更新したいフィールドだけを入れて送ればよい（未指定のフィールドは変更しない）：
- *   { id, reviewStatus?, confirmedImportance?, homeDisplayConfirmed?, confirmedBy? }
- * confirmedImportance または homeDisplayConfirmed を指定した場合は、
- * 対応する「確定した人」「確定日時」も自動で一緒に書き込む。
- */
-function updateItemStatusInSheet_(body) {
+function handleUpdateItemStatus_(body) {
+  var validation = validateUpdateItemStatusInput_(body);
+  if (!validation.valid) {
+    return jsonResponse_({ ok: false, error: validation.error });
+  }
+
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var sheet = ss.getSheetByName(INFO_ITEMS_SHEET_NAME);
   if (!sheet) {
-    throw new Error('「情報アイテム変換結果」シートがありません。先にrunConvertAllToInformationItemsを実行してください。');
+    return jsonResponse_({ ok: false, error: INFO_ITEMS_SHEET_NAME + ' シートがありません。先に runConvertAllToInformationItems を実行してください。' });
   }
 
   var lastRow = sheet.getLastRow();
   if (lastRow < 2) {
-    throw new Error('「情報アイテム変換結果」シートにデータがありません。');
+    return jsonResponse_({ ok: false, error: INFO_ITEMS_SHEET_NAME + ' シートにデータがありません。' });
   }
 
   var ids = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
   var targetRow = -1;
   for (var i = 0; i < ids.length; i++) {
     if (ids[i][0] === body.id) {
-      targetRow = i + 2; // 1行目は見出し、配列は0始まりなので+2
+      targetRow = i + 2;
       break;
     }
   }
   if (targetRow === -1) {
-    throw new Error('指定されたidの行が見つかりません: ' + body.id);
+    return jsonResponse_({ ok: false, error: '指定されたidの行が見つかりません: ' + body.id });
+  }
+
+  var existingRow = sheet.getRange(targetRow, 1, 1, INFO_ITEMS_COLUMN_COUNT).getValues()[0];
+  var existingState = rowToItemState_(existingRow);
+
+  var ruleCheck = businessRuleAllowsUpdate_(
+    {
+      reviewStatus: existingState.reviewStatus,
+      confirmedImportance: existingState.confirmedImportance,
+      homeDisplayNeedsReview: existingState.homeDisplayNeedsReview,
+    },
+    body,
+  );
+  if (!ruleCheck.allowed) {
+    return jsonResponse_({ ok: false, error: ruleCheck.error });
   }
 
   var now = new Date().toISOString();
+  var confirmedBy = typeof body.confirmedBy === 'string' ? body.confirmedBy.slice(0, MAX_CONFIRMED_BY_LENGTH_) : '';
 
+  // 列番号はINFO_ITEMS_HEADER_の並びに対応（1始まり）。
   if (body.reviewStatus !== undefined) {
-    sheet.getRange(targetRow, 7).setValue(body.reviewStatus); // reviewStatus列
+    sheet.getRange(targetRow, 9).setValue(body.reviewStatus); // reviewStatus
   }
   if (body.confirmedImportance !== undefined) {
-    sheet.getRange(targetRow, 16).setValue(body.confirmedImportance); // confirmedImportance列
-    sheet.getRange(targetRow, 17).setValue(body.confirmedBy || ''); // importanceConfirmedBy列
-    sheet.getRange(targetRow, 18).setValue(now); // importanceConfirmedAt列
+    sheet.getRange(targetRow, 23).setValue(body.confirmedImportance); // confirmedImportance
+    sheet.getRange(targetRow, 24).setValue(confirmedBy); // importanceConfirmedBy
+    sheet.getRange(targetRow, 25).setValue(now); // importanceConfirmedAt
   }
   if (body.homeDisplayConfirmed !== undefined) {
-    sheet.getRange(targetRow, 19).setValue(body.homeDisplayConfirmed); // homeDisplayConfirmed列
-    sheet.getRange(targetRow, 20).setValue(body.confirmedBy || ''); // homeDisplayConfirmedBy列
-    sheet.getRange(targetRow, 21).setValue(now); // homeDisplayConfirmedAt列
+    sheet.getRange(targetRow, 26).setValue(body.homeDisplayConfirmed); // homeDisplayConfirmed
+    sheet.getRange(targetRow, 27).setValue(confirmedBy); // homeDisplayConfirmedBy
+    sheet.getRange(targetRow, 28).setValue(now); // homeDisplayConfirmedAt
   }
+  // 「再確認必要」フラグは、明示的に「内容を確認済みにする」（reviewStatus: 'reviewed'）を
+  // 行った時だけ解除する。重要度だけ・HOME表示だけの操作では解除しない
+  // （内容を見ずに重要度やHOME表示を触っただけで警告が消えてしまうのを防ぐため）。
+  if (body.reviewStatus === 'reviewed') {
+    sheet.getRange(targetRow, 29).setValue(false); // homeDisplayNeedsReview
+  }
+
+  return jsonResponse_({ ok: true });
 }
 
-function jsonResponse_(obj) {
-  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(
-    ContentService.MimeType.JSON,
-  );
+/**
+ * ウォッチ設定の更新。既知のIDはコード側に固定した ALLOWED_WATCH_IDS_ を必ず使う
+ * （まだ一度も保存されていない場合にgetWatchSettings_がnullを返し、任意のIDを
+ * 保存できてしまう問題を防ぐため）。
+ */
+function handleUpdateWatchSettings_(body) {
+  var validation = validateWatchSettingsInput_(body.settings, ALLOWED_WATCH_IDS_);
+  if (!validation.valid) {
+    return jsonResponse_({ ok: false, error: validation.error });
+  }
+  saveWatchSettings_(body.settings);
+  return jsonResponse_({ ok: true });
 }
 
 /* ============================================================
- * ここから：定期自動実行（時間主導トリガー）の設定
- * ============================================================
- * これを設定すると、フリちゃんが手動で実行しなくても、毎日決まった時刻に
- * runConvertAllToInformationItems が自動で実行され、「情報アイテム変換結果」
- * シートが最新化される（＝アプリで「実データを読み込む」を押すたびに
- * 新しい内容が反映されるようになる）。
- *
- * 使い方：
- *   1. setupDailyTrigger を1回だけ実行する（初回は権限承認が出る）
- *   2. listTriggers を実行して、意図通り設定されたか確認する
- *   3. 設定をやめたい時は removeDailyTrigger を実行する
- *
- * もし自動実行中にエラーが起きた場合、Googleから
- * フリちゃんのGoogleアカウント宛に自動でエラー通知メールが届く
- * （GASの標準機能。特別な設定は不要）。
- */
+ * セクションD：定期自動実行（時間主導トリガー）の設定
+ * ------------------------------------------------------------
+ * v2から関数名（runConvertAllToInformationItems）を変えていないため、
+ * 既にsetupDailyTriggerを実行済みであれば、トリガーの再作成は不要。
+ * ============================================================ */
 
 var DAILY_TRIGGER_HANDLER_FUNCTION = 'runConvertAllToInformationItems';
 var DAILY_TRIGGER_HOUR = 7; // 毎朝7時台に実行（実際の発火時刻はGASの仕様で±15分程度前後する）
 
-/** 毎日決まった時間帯に runConvertAllToInformationItems を自動実行するトリガーを作る。 */
 function setupDailyTrigger() {
-  // 既に同じ関数を呼ぶトリガーがあれば、重複させないよう一旦削除してから作り直す
   var existingTriggers = ScriptApp.getProjectTriggers();
   existingTriggers.forEach(function (trigger) {
     if (trigger.getHandlerFunction() === DAILY_TRIGGER_HANDLER_FUNCTION) {
@@ -904,13 +1860,9 @@ function setupDailyTrigger() {
     .inTimezone('Asia/Tokyo')
     .create();
 
-  Logger.log(
-    '毎日' + DAILY_TRIGGER_HOUR + '時台に ' + DAILY_TRIGGER_HANDLER_FUNCTION +
-      ' を自動実行するトリガーを設定しました。',
-  );
+  Logger.log('毎日' + DAILY_TRIGGER_HOUR + '時台に ' + DAILY_TRIGGER_HANDLER_FUNCTION + ' を自動実行するトリガーを設定しました。');
 }
 
-/** 今、このプロジェクトにどんなトリガーが設定されているか一覧表示する（確認用）。 */
 function listTriggers() {
   var triggers = ScriptApp.getProjectTriggers();
   if (triggers.length === 0) {
@@ -918,15 +1870,10 @@ function listTriggers() {
     return;
   }
   triggers.forEach(function (trigger) {
-    Logger.log(
-      '関数: ' + trigger.getHandlerFunction() +
-        ' / 種類: ' + trigger.getEventType() +
-        ' / トリガーID: ' + trigger.getUniqueId(),
-    );
+    Logger.log('関数: ' + trigger.getHandlerFunction() + ' / 種類: ' + trigger.getEventType() + ' / トリガーID: ' + trigger.getUniqueId());
   });
 }
 
-/** runConvertAllToInformationItems の自動実行トリガーをすべて削除する（自動実行をやめたい時用）。 */
 function removeDailyTrigger() {
   var triggers = ScriptApp.getProjectTriggers();
   var removed = 0;
@@ -937,4 +1884,87 @@ function removeDailyTrigger() {
     }
   });
   Logger.log(removed + '件のトリガーを削除しました。');
+}
+
+/* ============================================================
+ * セクションE：旧バージョン互換のPoC・デバッグ用関数
+ * ------------------------------------------------------------
+ * 「PMDA_回収情報_PoC」シートへ生のCSVをそのまま書き出すだけの、
+ * 最初期の動作確認用スクリプト。information_itemsの仕組みとは独立しており、
+ * 削除すると困る場合があるためそのまま残している。
+ * ============================================================ */
+
+var PMDA_RECALL_SHEET_NAME = 'PMDA_回収情報_PoC';
+
+function runPmdaRecallCsvPoc() {
+  var fiscalYear2Digit = currentJapaneseFiscalYear2Digit_(new Date());
+  var recallClass = 1;
+  var url = 'https://www.info.pmda.go.jp/kaisyuu/rcidx' + fiscalYear2Digit + '-' + recallClass + 'm.csv';
+
+  Logger.log('取得先: ' + url);
+
+  var rows = fetchAndParseCsv_(url);
+  if (!rows) {
+    Logger.log('取得または解析に失敗しました。');
+    return;
+  }
+  Logger.log('データ行数（見出しを除く）: ' + rows.length);
+
+  if (rows.length === 0) {
+    Logger.log('1件もデータがありませんでした。URLやCSVの形式を確認してください。');
+    return;
+  }
+
+  writeRowsToSheet_(rows, url);
+}
+
+function writeRowsToSheet_(rows, sourceUrl) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(PMDA_RECALL_SHEET_NAME);
+  var isNewSheet = false;
+  if (!sheet) {
+    sheet = ss.insertSheet(PMDA_RECALL_SHEET_NAME);
+    isNewSheet = true;
+  }
+
+  var header = ['取得日時'].concat(CSV_COLUMNS).concat(['取得元URL']);
+
+  if (isNewSheet) {
+    sheet.appendRow(header);
+    sheet.setFrozenRows(1);
+  }
+
+  var existingRecallNumbers = loadExistingRecallNumbers_(sheet);
+  var fetchedAt = new Date();
+  var appended = 0;
+  var skippedDuplicate = 0;
+
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i];
+    var recallNumber = row[0];
+
+    if (existingRecallNumbers[recallNumber]) {
+      skippedDuplicate++;
+      continue;
+    }
+
+    var outRow = [fetchedAt].concat(row).concat([sourceUrl]);
+    sheet.appendRow(outRow);
+    existingRecallNumbers[recallNumber] = true;
+    appended++;
+  }
+
+  Logger.log('書き込み完了：新規 ' + appended + ' 件、重複スキップ ' + skippedDuplicate + ' 件');
+}
+
+function loadExistingRecallNumbers_(sheet) {
+  var keys = {};
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return keys;
+
+  var values = sheet.getRange(2, 2, lastRow - 1, 1).getValues();
+  for (var i = 0; i < values.length; i++) {
+    keys[values[i][0]] = true;
+  }
+  return keys;
 }

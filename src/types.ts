@@ -12,6 +12,9 @@ export type ImportanceLevel = 'critical' | 'caution' | 'info'
 
 export type ReviewStatus = 'unreviewed' | 'reviewing' | 'reviewed' | 'excluded'
 
+/** GAS側で情報源ごとに検知した変更区分。新規／内容変更／変更なし／解消（供給再開等）／掲載未確認。 */
+export type ChangeStatus = 'new' | 'updated' | 'unchanged' | 'resolved' | 'missing'
+
 export type ItemType =
   | '回収'
   | '緊急安全性情報'
@@ -33,6 +36,8 @@ export interface SourceLink {
 
 export interface InformationItem {
   id: string
+  /** どの情報源から取得したか（例：pmda_recall / mhlw_supply）。モックデータには無い場合がある。 */
+  sourceId?: string
   category: WatchCategory
   itemType: ItemType
   title: string
@@ -46,6 +51,14 @@ export interface InformationItem {
   reviewStatus: ReviewStatus
   publishedAt: string // YYYY-MM-DD
   fetchedAt: string
+  /** 直近の取得日時（毎回の自動取得ごとに更新される）。 */
+  lastFetchedAt?: string
+  /** 内容が最後に変わったと検知された日時。変更がなければnull。 */
+  lastChangedAt?: string | null
+  /** 今回の取得で検知された変更区分。モックデータや旧形式のAPIには無い場合がある。 */
+  changeStatus?: ChangeStatus
+  /** changeStatusが'missing'の場合の連続欠落回数。1回だけでは解消と判定しないための参考情報。 */
+  missingStreak?: number
   sourceName: string
   documentNumber: string | null
   pharmacyImpact: string
@@ -55,8 +68,21 @@ export interface InformationItem {
   homeDisplayConfirmed: boolean
   homeDisplayConfirmedBy: string | null
   homeDisplayConfirmedAt: string | null
+  /** HOME表示確定済みの情報の内容が変わり、再確認が必要になっている状態。 */
+  homeDisplayNeedsReview?: boolean
   links: SourceLink[]
   fetchError?: string
+}
+
+/** GAS側の情報源（PMDA回収情報・厚労省供給情報など）ごとの、直近の取得状況。 */
+export interface SourceStatus {
+  sourceId: string
+  label: string
+  lastRunAt: string | null
+  lastSuccessAt: string | null
+  success: boolean
+  fetchedCount: number
+  errorMessage: string | null
 }
 
 export type WatchLevel = 'off' | 'watch' | 'home'

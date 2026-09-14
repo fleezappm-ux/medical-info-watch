@@ -153,6 +153,35 @@
   color: var(--brand);
 }
 
+/* --- 情報源ごとの取得状況 --- */
+.source-status-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 12px 0;
+  padding: 10px 14px;
+  background: var(--paper-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+}
+
+.source-status-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--ink-soft);
+}
+
+.source-status-row.is-error {
+  color: var(--signal-critical);
+}
+
+.source-status-label {
+  font-weight: 700;
+  min-width: 8em;
+}
+
 /* --- 一覧 --- */
 .item-list {
   list-style: none;
@@ -225,6 +254,38 @@
 .item-row-error-flag {
   color: var(--signal-critical);
   font-weight: 700;
+}
+
+.item-row-home-review-flag {
+  color: var(--signal-caution);
+  font-weight: 700;
+}
+
+.item-row-change {
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-weight: 700;
+  font-size: 11px;
+}
+
+.item-row-change-new {
+  background: var(--signal-info-soft);
+  color: var(--signal-info);
+}
+
+.item-row-change-updated {
+  background: var(--signal-caution-soft);
+  color: var(--signal-caution);
+}
+
+.item-row-change-resolved {
+  background: var(--signal-neutral-soft);
+  color: var(--signal-neutral);
+}
+
+.item-row-change-missing {
+  background: var(--signal-caution-soft);
+  color: var(--signal-caution);
 }
 
 .empty-state {
@@ -325,6 +386,15 @@
   padding: 10px 14px;
   border-radius: var(--radius-sm);
   font-size: 14px;
+}
+
+.home-review-notice {
+  background: var(--signal-caution-soft);
+  color: var(--signal-caution);
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  margin-top: 12px;
 }
 
 .item-detail-columns {

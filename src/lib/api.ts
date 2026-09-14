@@ -1,15 +1,17 @@
-import type { InformationItem, WatchSetting } from '../types'
+import type { InformationItem, SourceStatus, WatchSetting } from '../types'
 
 interface ApiResponse {
   items?: InformationItem[]
   error?: string
   generatedAt?: string
   watchSettings?: WatchSetting[] | null
+  sourceStatuses?: SourceStatus[] | null
 }
 
 export interface FetchedData {
   items: InformationItem[]
   watchSettings: WatchSetting[] | null
+  sourceStatuses: SourceStatus[] | null
 }
 
 export async function fetchInformationItemsFromApi(apiUrl: string): Promise<FetchedData> {
@@ -24,7 +26,11 @@ export async function fetchInformationItemsFromApi(apiUrl: string): Promise<Fetc
   if (!data.items) {
     throw new Error('APIの応答にitemsが含まれていません')
   }
-  return { items: data.items, watchSettings: data.watchSettings ?? null }
+  return {
+    items: data.items,
+    watchSettings: data.watchSettings ?? null,
+    sourceStatuses: data.sourceStatuses ?? null,
+  }
 }
 
 /**
