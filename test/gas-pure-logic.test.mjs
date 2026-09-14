@@ -100,8 +100,8 @@ describe('extractRecallClassLabel_（表示用クラス名の抽出）', () => {
   })
 })
 
-describe('buildPmdaRecallItem_ のsourceId付きid生成', () => {
-  it('idはsourceId + 回収番号になり、クラスをまたいでも回収番号が同じならsourceIdで区別される', () => {
+describe('buildPmdaRecallItem_ のid生成（v3.2.1で修正）', () => {
+  it('idは常に「pmda_recall_ + 回収番号」になり、sourceIdは含めない（回収番号自体がクラスをまたいで一意なため）', () => {
     const row = [
       '1-9999', // 回収番号
       "'2026/06/26", // 掲載年月日
@@ -111,16 +111,18 @@ describe('buildPmdaRecallItem_ のsourceId付きid生成', () => {
       '販売名：テスト薬', // 一般的名称及び販売名
       '', '', '理由テスト', '', '', '', '', '', '', // 残りの列
     ]
-    const itemClass2 = gas.buildPmdaRecallItem_(row, 'https://example.com/list.html', '2026-09-14T00:00:00.000Z', 'pmda_recall_class2')
-    expect(itemClass2.id).toBe('pmda_recall_class2_1-9999')
-    expect(itemClass2.sourceRecordId).toBe('1-9999')
-    expect(itemClass2.aiImportance).toBe('caution')
-    expect(itemClass2.sourceName).toContain('クラスII')
+    const item = gas.buildPmdaRecallItem_(row, 'https://example.com/list.html', '2026-09-14T00:00:00.000Z')
+    expect(item.id).toBe('pmda_recall_1-9999')
+    expect(item.sourceRecordId).toBe('1-9999')
+    expect(item.aiImportance).toBe('caution')
+    expect(item.sourceName).toContain('クラスII')
 
-    const itemClass3 = gas.buildPmdaRecallItem_(row, 'https://example.com/list.html', '2026-09-14T00:00:00.000Z', 'pmda_recall_class3')
-    expect(itemClass3.id).toBe('pmda_recall_class3_1-9999')
-    // 同じ回収番号でもsourceIdが違うのでidは衝突しない
-    expect(itemClass3.id).not.toBe(itemClass2.id)
+    // v3.1以前からの既存データ（クラスIのみの時代のid）とも完全に互換性がある
+    // ＝同じ回収番号なら、クラス表記が違っても同じidになる
+    const rowClass1 = row.slice()
+    rowClass1[4] = '（クラスI）'
+    const itemClass1 = gas.buildPmdaRecallItem_(rowClass1, 'https://example.com/list.html', '2026-09-14T00:00:00.000Z')
+    expect(itemClass1.id).toBe(item.id)
   })
 })
 
@@ -664,5 +666,141 @@ describe('filterAndFormatHistoryRows_（変更履歴の抽出・整形）', () =
 
   it('該当するitemIdが無ければ空配列を返す', () => {
     expect(gas.filterAndFormatHistoryRows_(rows, 'item_not_exist')).toEqual([])
+  })
+})
+
+describe('stripHtmlTags_', () => {
+  it('タグを除去し、代表的なHTML実体参照を戻す', () => {
+    const html = '<a href="x">2026年9月8日&nbsp;Minds関連&nbsp;<span>「大型血管炎」の診療ガイドラインを公開しました</span></a>'
+    expect(gas.stripHtmlTags_(html)).toBe(
+      ' 2026年9月8日 Minds関連  「大型血管炎」の診療ガイドラインを公開しました  ',
+    )
+  })
+
+  it('null/undefinedは空文字として扱う', () => {
+    expect(gas.stripHtmlTags_(null)).toBe('')
+    expect(gas.stripHtmlTags_(undefined)).toBe('')
+  })
+})
+
+describe('parseMindsNewsEntryText_', () => {
+  it('日付・カテゴリを取り除いてタイトルだけを取り出す', () => {
+    const result = gas.parseMindsNewsEntryText_(
+      '2026年9月8日 Minds関連 「大型血管炎」の診療ガイドラインを公開しました',
+    )
+    expect(result).toEqual({
+      publishedAt: '2026-09-08',
+      title: '「大型血管炎」の診療ガイドラインを公開しました',
+    })
+  })
+
+  it('1桁月日でも0埋めして正規化する', () => {
+    const result = gas.parseMindsNewsEntryText_('2026年9月1日 Minds関連 「急性腹症」の診療ガイドラインを公開しました')
+    expect(result.publishedAt).toBe('2026-09-01')
+  })
+
+  it('日付が見つからない場合はpublishedAtが空文字になる', () => {
+    const result = gas.parseMindsNewsEntryText_('Minds関連 お知らせ本文のみ')
+    expect(result.publishedAt).toBe('')
+  })
+
+  it('未知のカテゴリ表記が残ってもタイトルの「ガイドライン」判定には影響しない（先頭に余分な単語が残るだけ）', () => {
+    const result = gas.parseMindsNewsEntryText_('2026年9月8日 未知カテゴリ 「熱中症」の診療ガイドラインを公開しました')
+    expect(result.title).toContain('ガイドライン')
+  })
+})
+
+describe('isGuidelineNewsTitle_', () => {
+  it('タイトルに「ガイドライン」を含めばtrue', () => {
+    expect(gas.isGuidelineNewsTitle_('「熱中症」の診療ガイドラインを公開しました')).toBe(true)
+  })
+
+  it('含まなければfalse（事務連絡ノイズの除外）', () => {
+    expect(gas.isGuidelineNewsTitle_('「組織」ページを更新しました')).toBe(false)
+  })
+
+  it('文字列以外はfalse', () => {
+    expect(gas.isGuidelineNewsTitle_(null)).toBe(false)
+    expect(gas.isGuidelineNewsTitle_(undefined)).toBe(false)
+  })
+})
+
+describe('extractMindsNewsEntries_', () => {
+  const sampleHtml = `
+    <ul>
+      <li><a href="https://minds.jcqhc.or.jp/news-16138/">2026年9月8日 Minds関連 「大型血管炎」の診療ガイドラインを公開しました</a></li>
+      <li><a href="https://minds.jcqhc.or.jp/news-16133/">2026年9月1日 Minds関連 「急性腹症」の診療ガイドラインを公開しました</a></li>
+      <li><a href="https://minds.jcqhc.or.jp/news-16120/">2026年8月21日 Minds関連 「書誌情報」新規公開のお知らせ</a></li>
+      <li><a href="/news-16065/">2026年7月28日 Minds関連 「組織」ページを更新しました</a></li>
+    </ul>
+  `
+
+  it('お知らせごとに{newsId, url, publishedAt, title}を抽出する', () => {
+    const entries = gas.extractMindsNewsEntries_(sampleHtml)
+    expect(entries).toHaveLength(4)
+    expect(entries[0]).toEqual({
+      newsId: '16138',
+      url: 'https://minds.jcqhc.or.jp/news-16138/',
+      publishedAt: '2026-09-08',
+      title: '「大型血管炎」の診療ガイドラインを公開しました',
+    })
+  })
+
+  it('ドメイン省略の相対リンク（/news-xxxx/）も拾う', () => {
+    const entries = gas.extractMindsNewsEntries_(sampleHtml)
+    const found = entries.find((e) => e.newsId === '16065')
+    expect(found).toBeTruthy()
+    expect(found.url).toBe('https://minds.jcqhc.or.jp/news-16065/')
+  })
+
+  it('同じnewsIdへの重複リンクは1件だけ採用する', () => {
+    const htmlWithDuplicate = `
+      <a href="https://minds.jcqhc.or.jp/news-16138/"><img src="thumb.jpg" /></a>
+      <a href="https://minds.jcqhc.or.jp/news-16138/">2026年9月8日 Minds関連 「大型血管炎」の診療ガイドラインを公開しました</a>
+    `
+    const entries = gas.extractMindsNewsEntries_(htmlWithDuplicate)
+    expect(entries).toHaveLength(1)
+    expect(entries[0].title).toBe('「大型血管炎」の診療ガイドラインを公開しました')
+  })
+
+  it('お知らせリンクが1件も無ければ空配列を返す', () => {
+    expect(gas.extractMindsNewsEntries_('<html><body>no news here</body></html>')).toEqual([])
+  })
+})
+
+describe('buildMindsIncomingItems_ / buildMindsGuidelineItem_', () => {
+  const entries = [
+    { newsId: '16138', url: 'https://minds.jcqhc.or.jp/news-16138/', publishedAt: '2026-09-08', title: '「大型血管炎」の診療ガイドラインを公開しました' },
+    { newsId: '16120', url: 'https://minds.jcqhc.or.jp/news-16120/', publishedAt: '2026-08-21', title: '「書誌情報」新規公開のお知らせ' },
+  ]
+
+  it('タイトルに「ガイドライン」を含むものだけをアイテムに変換する', () => {
+    const items = gas.buildMindsIncomingItems_(entries, 'https://minds.jcqhc.or.jp/news/', '2026-09-14T00:00:00.000Z')
+    expect(items).toHaveLength(1)
+    expect(items[0].id).toBe('minds_guideline_16138')
+  })
+
+  it('カテゴリはclinical、重要度は一律info、sourceRecordIdはnewsIdになる', () => {
+    const item = gas.buildMindsGuidelineItem_(entries[0], 'https://minds.jcqhc.or.jp/news/', '2026-09-14T00:00:00.000Z')
+    expect(item.category).toBe('clinical')
+    expect(item.itemType).toBe('ガイドライン')
+    expect(item.aiImportance).toBe('info')
+    expect(item.sourceRecordId).toBe('16138')
+    expect(item.primaryUrl).toBe('https://minds.jcqhc.or.jp/news-16138/')
+    expect(item.title).toBe('「大型血管炎」の診療ガイドラインを公開しました')
+  })
+
+  it('同じ内容なら同じcontentHash、タイトルが変われば別ハッシュになる', () => {
+    const a = gas.buildMindsGuidelineItem_(entries[0], 'x', 't')
+    const b = gas.buildMindsGuidelineItem_(entries[0], 'x', 't')
+    const c = gas.buildMindsGuidelineItem_({ ...entries[0], title: entries[0].title + '（訂正）' }, 'x', 't')
+    expect(a.contentHash).toBe(b.contentHash)
+    expect(a.contentHash).not.toBe(c.contentHash)
+  })
+})
+
+describe('linkLabelForItemType_（ガイドライン追加分）', () => {
+  it("itemType 'ガイドライン' はMindsのラベルを返す", () => {
+    expect(gas.linkLabelForItemType_('ガイドライン')).toBe('Minds お知らせページ（原文）')
   })
 })

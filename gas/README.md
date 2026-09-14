@@ -1,8 +1,8 @@
-# GAS実装（v3.1）
+# GAS実装（v3.3）
 
 `pmda-recall-fetcher.gs` 1ファイルに、データ取得・変更検知・Web App化・定期実行のすべてが入っている（フリちゃんが「ファイルを丸ごと貼り替える」運用のため、あえて単一ファイル構成にしている）。
 
-v3からの変更点（2次監査対応）は本ファイル末尾の「v3→v3.1の変更点」を参照。
+v3からの変更点（2次監査対応）は本ファイル末尾の「v3→v3.1の変更点」を、v3.1以降の変更点はさらにその下の各節を参照。
 
 ## 取得している情報
 
@@ -11,6 +11,7 @@ v3からの変更点（2次監査対応）は本ファイル末尾の「v3→v3.
 - `https://www.info.pmda.go.jp/kaisyuu/rcidx{年度2桁}-{クラス}{区分}.csv`
 - クラスI・II・III（医薬品等）を取得。年度は実行時点の日付から自動算出する（`currentJapaneseFiscalYear2Digit_`）ため、年度が変わってもコード修正は不要。
 - クラスごとに独立した情報源（`pmda_recall_class1`/`pmda_recall_class2`/`pmda_recall_class3`、`PMDA_RECALL_CLASSES_`で定義）として取得・成功失敗判定・変更検知を行う。1クラスのCSVが一時的に取得できなくても、他クラスの更新・既存データには影響しない（`source_run_logs`にもクラスごとに記録される）。
+- idは常に「`pmda_recall_` + 回収番号」（v3.2.1で修正。回収番号自体がクラスをまたいで一意なため、sourceIdは含めない）。
 - 対象を医療機器等（区分`k`）にも広げる場合は`PMDA_RECALL_CLASSES_`と取得URLの区分文字を見直す必要がある（現在は医薬品等`m`区分のみ）。
 
 ### 厚生労働省 医療用医薬品供給状況
@@ -21,6 +22,14 @@ v3からの変更点（2次監査対応）は本ファイル末尾の「v3→v3.
   - 通常出荷：**Excelで明示的に確認できた場合だけ**、既に追跡中のYJコードを「供給再開」として一覧に出す
   - 追跡中のYJコードが今回のExcelに見当たらない：「掲載未確認（要手動確認）」として扱う（詳細は後述）
 
+### Mindsガイドラインライブラリ「お知らせ」（v3.3で追加）
+
+- `https://minds.jcqhc.or.jp/news/`（お知らせ一覧の1ページ目）をHTML取得・パースする（PMDAのようなCSV配布は無いため）。更新頻度が週1〜数件程度のため、1ページ目（最新10件程度）のみの取得で日次実行なら取りこぼしの心配はほぼ無い。
+- 各お知らせのURL固有ID（`news-{数字}`）を、回収番号やYJコードと同様の一意キーとして使う（`minds_guideline_{数字}`がinformation_itemsのid）。
+- **タイトルに「ガイドライン」を含むものだけ**を対象にする（「組織ページを更新しました」等の事務連絡ノイズを除外するため）。それ以外のお知らせは取得はするが一覧には出さない。
+- カテゴリは`clinical`（治療・臨床ウォッチ、`watch_clinical`）に固定。重要度は一律`info`（参考）からスタートし、Minds側にはPMDAの回収クラスのような自動判定基準が無いため、人間が個別に確認・重要度確定する運用。
+- 一覧ページのHTML構造に依存したパース（`extractMindsNewsEntries_`）のため、Minds側でページのマークアップが大きく変わると抽出できなくなる可能性がある。その場合は`fetchMindsGuidelineSourceResult_`が「取得0件」または失敗として`source_run_logs`に記録されるので、そこで気づける（他の情報源には影響しない）。
+
 ## データの構造
 
 Googleスプレッドシート内に3つのシートを持つ。
@@ -29,7 +38,7 @@ Googleスプレッドシート内に3つのシートを持つ。
 | --- | --- |
 | `information_items` | 現在の状態（1id=1行）。人間の確認状態・重要度・HOME表示・変更検知用のハッシュ・欠落回数を含む |
 | `information_item_history` | 内容変更・供給再開・掲載未確認を検知するたびに追記される変更履歴 |
-| `source_run_logs` | 情報源（PMDA／厚労省）ごとの実行結果（成功/失敗・件数・エラー内容）のログ |
+| `source_run_logs` | 情報源（PMDA／厚労省／Minds）ごとの実行結果（成功/失敗・件数・エラー内容）のログ |
 
 v2までの「情報アイテム変換結果」シートは削除しない。初回実行時に自動移行され、「旧_情報アイテム変換結果」という名前でそのまま残る（詳細は後述）。
 
@@ -114,6 +123,7 @@ PMDA CSV・厚労省Excelから取得した文字列のうち、先頭が `=` `+
 
 - `runConvertPmdaRecallToInformationItems`：PMDAだけ取得してマージ
 - `runConvertMhlwSupplyToInformationItems`：厚労省供給状況だけ取得してマージ
+- `runConvertMindsGuidelineToInformationItems`：Mindsガイドラインお知らせだけ取得してマージ
 - `runPmdaRecallCsvPoc`：`information_items` の仕組みとは独立した、PMDA CSVの生データ確認用（`PMDA_回収情報_PoC`シート）
 - `listTriggers` / `setupDailyTrigger` / `removeDailyTrigger`：定期実行トリガーの確認・設定・削除
 
@@ -136,6 +146,24 @@ PMDA CSV・厚労省Excelから取得した文字列のうち、先頭が `=` `+
 2. idの生成方式を`sourceId + 回収番号`に変更（旧`pmda_recall_ + 回収番号`）。クラスをまたいで回収番号が重複してもinformation_itemsシート全体でidが一意になるようにするため
 3. 画面表示用に、情報源名（sourceName）へクラス名（クラスI/II/III）を含めるようにした（`extractRecallClassLabel_`）
 4. `doGet`に`?action=history&itemId=...`クエリを追加し、`information_item_history`から指定アイテムの変更履歴（新しい順・最大50件）を返せるようにした（`getHistoryForItem_` / `filterAndFormatHistoryRows_`）。アプリの詳細画面に「変更履歴」セクションを追加し、この新しいクエリを使って表示している
+
+## v3.2→v3.2.1の変更点（不具合修正）
+
+v3.2でPMDA回収情報のidを「sourceId + 回収番号」に変更したが、これは不要な変更であり、むしろv3.1以前からの既存データ（クラスIのみを扱っていた時代のid）と不整合を起こしていた（クラスIの既存データが「別の新規データ」として二重登録されてしまう不具合）。回収番号自体がPMDAの発行するクラスをまたいでも重複しない一意な番号のため、idは`pmda_recall_ + 回収番号`に戻した。
+
+上記不具合で二重登録されてしまった行を片付けるための一度きりの関数`runCleanupBuggyClassPrefixedPmdaIds`を追加した（GASエディタの実行プルダウンから手動実行する。該当行が無ければ「0件削除」と出るだけで、何度実行しても安全）。実行後、あらためて`runConvertAllToInformationItems`を実行し、正しいidで再取得・マージし直すこと。
+
+**Apps Scriptエディタの仕様上の注意**：関数名の末尾がアンダースコア（`_`）で終わる関数は、実行プルダウンに一切表示されない（「内部用・直接実行しない関数」という慣習を汲んだ仕様）。手動実行してほしい関数を追加する際は、必ずアンダースコア無しの名前（`runXxx`のような形）にすること。
+
+## v3.2.1→v3.3の変更点（ガイドラインウォッチボットの追加）
+
+Mindsガイドラインライブラリ（公益財団法人日本医療機能評価機構が運営）の「お知らせ」ページを新しい情報源（`minds_guideline`）として追加した。詳細は上の「取得している情報」内の該当節を参照。
+
+- 他の情報源と同様、独立したsourceId・`source_run_logs`エントリを持つため、この情報源の取得失敗・ページ構成変更が他情報源（PMDA・厚労省）に影響することはない
+- `runConvertAllToInformationItems`（毎朝の自動実行）が3情報源（PMDA・厚労省・Minds）すべてを取得するようになった
+- 単体デバッグ実行用に`runConvertMindsGuidelineToInformationItems`を追加した
+- HTML解析はGAS API非依存の純粋関数（`stripHtmlTags_` / `parseMindsNewsEntryText_` / `extractMindsNewsEntries_` / `isGuidelineNewsTitle_` / `buildMindsGuidelineItem_` / `buildMindsIncomingItems_`）として実装し、`test/gas-pure-logic.test.mjs`でテストしている
+- 一覧ページの実際のHTML構造（クラス名など）は未確認のまま実装している。href（`/news-{数字}/`）というURLパターンだけを頼りに抽出するようにして構造変化に強くしてあるが、**初回実行後は`information_items`シートに実際に「ガイドライン」アイテムが正しく登録されているか、フリちゃんの環境で必ず確認してほしい**（0件のままなら`source_run_logs`のエラー内容を確認）
 
 ## 次のステップ
 

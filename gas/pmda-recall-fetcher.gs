@@ -1,6 +1,25 @@
 /**
- * 医療情報ウォッチ GAS本体（v3.2）
+ * 医療情報ウォッチ GAS本体（v3.3）
  * ------------------------------------------------------------
+ * v3.2.1からの変更点（ガイドラインウォッチボットの追加）：
+ *   ・Mindsガイドラインライブラリの「お知らせ」ページ（お知らせ一覧のHTML）を新しい情報源
+ *     （minds_guideline）として追加。他の情報源と同様、独立したsourceIdで成功/失敗・
+ *     変更検知を行うため、1情報源の取得失敗が他情報源に影響しない
+ *   ・お知らせ一覧の1ページ目（最新10件程度）だけを取得し、タイトルに「ガイドライン」を
+ *     含むものだけを対象にする（事務連絡ノイズの除外）。カテゴリはclinical
+ *     （watch_clinical）、重要度は一律info（参考）からスタートし、人間が個別に確認・
+ *     重要度確定する運用（Minds側にPMDAのクラス分けのような自動判定基準が無いため）
+ *   ・お知らせのURL固有ID（news-{数字}）を回収番号と同様の一意キーとして使用
+ *   詳細はgas/README.mdの「v3.2.1→v3.3の変更点」を参照。
+ *
+ * v3.2の不具合修正：
+ *   ・PMDA回収情報のidを「sourceId + 回収番号」にしていたのを「pmda_recall_ + 回収番号」に戻した。
+ *     回収番号はPMDAが発行するクラスをまたいでも重複しない一意な番号のため、
+ *     sourceIdを混ぜる必要が無く、むしろv3.1以前からの既存データと不整合を起こしていた
+ *     （クラスIの既存データが「別の新規データ」として二重登録されてしまう不具合）。
+ *   ・上記不具合で二重登録された行を片付けるための一度きりの関数
+ *     runCleanupBuggyClassPrefixedPmdaIds を追加（実行方法はgas/README.md参照）。
+ *
  * v3.1からの変更点（PMDA回収情報のクラスII・III拡大、変更履歴のAPI公開）：
  *   ・クラスI・II・IIIをそれぞれ独立した情報源（pmda_recall_class1/2/3）として取得。
  *     1クラスのCSV取得失敗が他クラスの更新・既存データに影響しないよう分離した
@@ -408,11 +427,12 @@ function normalizePublishedAt_(rawDate) {
  * 人間の確認状態（reviewStatus等）はここでは持たせない。それは
  * mergeSourceItems_ が既存データとの比較結果から決める。
  *
- * idにsourceIdを含めるのは、クラスI・II・IIIを別々の情報源として扱うようになったv3.2以降、
- * 回収番号がクラスをまたいで重複した場合でもinformation_itemsシート全体でidが
- * ユニークであることを保証するため（sourceRecordIdは回収番号そのものを保持する）。
+ * idは回収番号のみから作る（sourceIdは含めない）。回収番号はPMDAが発行する
+ * クラスをまたいでも重複しない一意な番号のため、これで既存データ（v3.1以前の
+ * クラスIのみの時代のid）とも完全に互換性がある。sourceRecordIdにも
+ * 同じ回収番号を保持しておき、情報源単位のマージ判定に使う。
  */
-function buildPmdaRecallItem_(row, listPageUrl, fetchedAtIso, sourceId) {
+function buildPmdaRecallItem_(row, listPageUrl, fetchedAtIso) {
   var recallNumber = row[0];
   var publishedAtRaw = row[1];
   var itemKind = row[2];
@@ -453,7 +473,7 @@ function buildPmdaRecallItem_(row, listPageUrl, fetchedAtIso, sourceId) {
   );
 
   return {
-    id: sourceId + '_' + recallNumber,
+    id: 'pmda_recall_' + recallNumber,
     sourceRecordId: String(recallNumber),
     category: 'pharmacy',
     itemType: '回収',
@@ -476,9 +496,9 @@ function buildPmdaRecallItem_(row, listPageUrl, fetchedAtIso, sourceId) {
 }
 
 /** CSVの全行を、information_items用オブジェクトの配列に変換する（純粋関数）。 */
-function buildPmdaIncomingItems_(rows, listPageUrl, fetchedAtIso, sourceId) {
+function buildPmdaIncomingItems_(rows, listPageUrl, fetchedAtIso) {
   return rows.map(function (row) {
-    return buildPmdaRecallItem_(row, listPageUrl, fetchedAtIso, sourceId);
+    return buildPmdaRecallItem_(row, listPageUrl, fetchedAtIso);
   });
 }
 
@@ -669,6 +689,160 @@ function buildMhlwSupplyIncomingItems_(currentByYjCode, existingMhlwStates, sour
   });
 
   return items;
+}
+
+// ---- Mindsガイドラインライブラリ「お知らせ」：HTML解析（GAS API非依存の純粋関数） ----
+
+/**
+ * HTMLタグを取り除き、代表的なHTML実体参照を普通の文字へ戻す（純粋関数）。
+ * お知らせ一覧のリンクの中身（日付・カテゴリ・タイトルがまとめて入っている）から
+ * プレーンテキストを取り出すために使う。厳密なHTMLパーサではないので、
+ * タグの入れ子や属性値の中の"<"等までは想定していない（お知らせ一覧のような
+ * シンプルなリンクテキストの抽出に用途を絞っている）。
+ */
+function stripHtmlTags_(html) {
+  var text = String(html || '');
+  text = text.replace(/<[^>]*>/g, ' ');
+  text = text
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#0?39;/gi, "'");
+  return text;
+}
+
+/**
+ * stripHtmlTags_後のテキスト（例："2026年9月8日 Minds関連 「大型血管炎」の診療ガイドラインを公開しました"）
+ * から、掲載日（"YYYY-MM-DD"）とタイトル（日付・カテゴリ表記を除いた部分）を取り出す（純粋関数）。
+ * 日付が見つからない場合はpublishedAtを空文字にする（呼び出し側で「不明」として扱われる）。
+ */
+function parseMindsNewsEntryText_(rawText) {
+  var text = String(rawText || '').replace(/\s+/g, ' ').trim();
+  var dateMatch = text.match(/(\d{4})年(\d{1,2})月(\d{1,2})日/);
+  var publishedAt = '';
+  var title = text;
+
+  if (dateMatch) {
+    var y = dateMatch[1];
+    var m = ('0' + dateMatch[2]).slice(-2);
+    var d = ('0' + dateMatch[3]).slice(-2);
+    publishedAt = y + '-' + m + '-' + d;
+    title = text.slice(text.indexOf(dateMatch[0]) + dateMatch[0].length);
+  }
+
+  // 既知のカテゴリ表記（日付の直後に来る想定）を取り除く。未知のカテゴリが増えても
+  // タイトル自体の抽出には支障がない（先頭の余分な単語が残るだけで、
+  // 「ガイドライン」を含むかどうかの判定やタイトル表示は成立する）。
+  title = title.replace(/^\s*(Minds関連|作成団体関連)\s*/, '').trim();
+
+  return { publishedAt: publishedAt, title: title };
+}
+
+/**
+ * タイトルに「ガイドライン」の文字を含むかどうか（合意済みの絞り込み条件）。
+ * 「組織ページを更新しました」等の事務連絡ノイズを除外するために使う。
+ */
+function isGuidelineNewsTitle_(title) {
+  return typeof title === 'string' && title.indexOf('ガイドライン') !== -1;
+}
+
+/**
+ * Mindsお知らせ一覧ページの生HTMLから、お知らせ1件ずつの{newsId, url, publishedAt, title}を
+ * 抜き出す（純粋関数）。各お知らせへのリンク（href="https://minds.jcqhc.or.jp/news-{数字}/"、
+ * ドメイン省略の相対リンクも許容）を探し、そのリンクの中のテキスト（日付・カテゴリ・タイトルが
+ * まとめて入っている）からparseMindsNewsEntryText_で日付とタイトルを分離する。
+ * 同じnewsIdへのリンクが複数回出てくる場合（サムネイル画像とテキストが別々にリンクしている等）は
+ * 最初に見つかったものだけを採用し、重複を作らない。
+ */
+function extractMindsNewsEntries_(html) {
+  var order = [];
+  var byId = {};
+  var pattern = /<a\b[^>]*href=["'](?:https?:\/\/minds\.jcqhc\.or\.jp)?\/news-(\d+)\/["'][^>]*>([\s\S]*?)<\/a>/gi;
+  var match;
+
+  while ((match = pattern.exec(html)) !== null) {
+    var newsId = match[1];
+    var parsed = parseMindsNewsEntryText_(stripHtmlTags_(match[2]));
+
+    if (!byId[newsId]) {
+      byId[newsId] = {
+        newsId: newsId,
+        url: 'https://minds.jcqhc.or.jp/news-' + newsId + '/',
+        publishedAt: parsed.publishedAt,
+        title: parsed.title,
+      };
+      order.push(newsId);
+    } else if (!byId[newsId].title && parsed.title) {
+      // 同じお知らせへの重複リンク（サムネイル画像とテキストが別々にリンクしている等）で、
+      // 先に見つかった方にタイトルが無い（画像だけだった）場合は、後から見つかった
+      // タイトル付きの方で補完する。
+      byId[newsId].title = parsed.title;
+      if (!byId[newsId].publishedAt && parsed.publishedAt) {
+        byId[newsId].publishedAt = parsed.publishedAt;
+      }
+    }
+  }
+
+  return order.map(function (id) {
+    return byId[id];
+  });
+}
+
+/** Mindsガイドラインのうち、内容変更判定に使うフィールドを決まった順序の配列にする。 */
+function mindsGuidelineHashFields_(f) {
+  return [f.newsId, f.publishedAt, f.title];
+}
+
+/**
+ * 1件のMindsお知らせエントリを、information_items用の「今回取得した内容」オブジェクトへ変換する
+ * （純粋関数。buildPmdaRecallItem_・buildMhlwSupplyItem_と同じ役割）。
+ * 重要度は一律'info'（参考）からスタートする：Minds側にはPMDAの回収クラスのような
+ * 自動判定できる分類が無いため、人間が個別に確認・重要度確定する運用にしている（合意済み）。
+ * 詳細本文までは取得していないため、summaryはタイトルをそのまま使う。
+ */
+function buildMindsGuidelineItem_(entry, listPageUrl, fetchedAtIso) {
+  var contentHash = computeContentHash_(
+    mindsGuidelineHashFields_({
+      newsId: entry.newsId,
+      publishedAt: entry.publishedAt,
+      title: entry.title,
+    }),
+  );
+
+  return {
+    id: 'minds_guideline_' + entry.newsId,
+    sourceRecordId: entry.newsId,
+    category: 'clinical',
+    itemType: 'ガイドライン',
+    title: sanitizeCellValue_(entry.title),
+    summary: sanitizeCellValue_(entry.title),
+    aiImportance: 'info',
+    publishedAt: entry.publishedAt,
+    sourceName: 'Mindsガイドラインライブラリ（お知らせ）',
+    documentNumber: sanitizeCellValue_('お知らせ番号：news-' + entry.newsId),
+    pharmacyImpact: '',
+    requiredAction: null,
+    primaryUrl: entry.url,
+    remarks: '',
+    contentHash: contentHash,
+    fetchedAtIso: fetchedAtIso,
+  };
+}
+
+/**
+ * お知らせ一覧の全エントリから、タイトルに「ガイドライン」を含むものだけを
+ * information_items用オブジェクトの配列に変換する（純粋関数）。
+ */
+function buildMindsIncomingItems_(entries, listPageUrl, fetchedAtIso) {
+  return entries
+    .filter(function (entry) {
+      return isGuidelineNewsTitle_(entry.title);
+    })
+    .map(function (entry) {
+      return buildMindsGuidelineItem_(entry, listPageUrl, fetchedAtIso);
+    });
 }
 
 // ---- 変更検知・マージ（データ消失防止の中心ロジック） ----
@@ -935,9 +1109,10 @@ function applyFetchResultsToState_(existingById, fetchResults, nowIso) {
   return { updatedById: updatedById, historyEntries: historyEntries, runLogs: runLogs };
 }
 
-/** itemType（'回収' / '供給' 等）から、リンクの見出しに使うラベルを決める。 */
+/** itemType（'回収' / '供給' / 'ガイドライン' 等）から、リンクの見出しに使うラベルを決める。 */
 function linkLabelForItemType_(itemType) {
   if (itemType === '供給') return '厚労省 医療用医薬品供給状況（Excel原本）';
+  if (itemType === 'ガイドライン') return 'Minds お知らせページ（原文）';
   return 'PMDA 回収情報一覧（原文）';
 }
 
@@ -1023,6 +1198,7 @@ var SOURCE_LABELS_ = {
   pmda_recall_class2: 'PMDA回収情報（クラスII）',
   pmda_recall_class3: 'PMDA回収情報（クラスIII）',
   mhlw_supply: '厚労省供給情報',
+  minds_guideline: 'Mindsガイドライン',
 };
 
 // 旧バージョン（v2）が使っていた「情報アイテム変換結果」シート関連
@@ -1448,7 +1624,7 @@ function fetchPmdaRecallSourceResult_(recallClass, sourceId) {
   }
 
   var listPageUrl = usedUrl.replace('.csv', '.html');
-  var items = buildPmdaIncomingItems_(rows, listPageUrl, fetchedAtIso, sourceId);
+  var items = buildPmdaIncomingItems_(rows, listPageUrl, fetchedAtIso);
 
   return { sourceId: sourceId, success: true, items: items, fetchedAt: fetchedAtIso, startedAt: startedAt, error: null };
 }
@@ -1585,6 +1761,55 @@ function fetchMhlwSupplySourceResult_(existingMhlwStates) {
   return { sourceId: 'mhlw_supply', success: true, items: items, fetchedAt: fetchedAtIso, startedAt: raw.startedAt, error: null };
 }
 
+// ---- Mindsガイドラインライブラリ「お知らせ」：ネットワーク取得（GAS依存） ----
+
+var MINDS_NEWS_LIST_URL = 'https://minds.jcqhc.or.jp/news/';
+
+/**
+ * Mindsお知らせ一覧（1ページ目・最新10件程度）を取得し、
+ * { sourceId, success, items, fetchedAt, error } の形で返す。
+ * 更新頻度が週1〜数件程度のため、1ページ目のみの取得で日次実行なら取りこぼしの
+ * 心配はほぼ無い（合意済みの方針）。PMDA・厚労省と同様、他の情報源とは独立した
+ * sourceId（minds_guideline）として成功/失敗を記録する。
+ */
+function fetchMindsGuidelineSourceResult_() {
+  var startedAt = new Date().toISOString();
+  try {
+    var response = UrlFetchApp.fetch(MINDS_NEWS_LIST_URL, { muteHttpExceptions: true, followRedirects: true });
+    var code = response.getResponseCode();
+    if (code !== 200) {
+      return {
+        sourceId: 'minds_guideline',
+        success: false,
+        items: [],
+        fetchedAt: new Date().toISOString(),
+        startedAt: startedAt,
+        error: 'お知らせ一覧ページの取得に失敗しました（HTTP ' + code + '）',
+      };
+    }
+
+    var html = response.getContentText('UTF-8');
+    var entries = extractMindsNewsEntries_(html);
+    if (entries.length === 0) {
+      Logger.log('Mindsお知らせ一覧からリンクを1件も抽出できませんでした。ページ構成が変わった可能性があります。');
+    }
+
+    var fetchedAtIso = new Date().toISOString();
+    var items = buildMindsIncomingItems_(entries, MINDS_NEWS_LIST_URL, fetchedAtIso);
+
+    return { sourceId: 'minds_guideline', success: true, items: items, fetchedAt: fetchedAtIso, startedAt: startedAt, error: null };
+  } catch (e) {
+    return {
+      sourceId: 'minds_guideline',
+      success: false,
+      items: [],
+      fetchedAt: new Date().toISOString(),
+      startedAt: startedAt,
+      error: 'お知らせ一覧の取得・解析中にエラー: ' + e,
+    };
+  }
+}
+
 /** existingByIdのうち、指定したsourceIdの分だけを sourceRecordId をキーにした形で取り出す。 */
 function pickStatesBySourceId_(existingById, sourceId) {
   var result = {};
@@ -1600,12 +1825,12 @@ function pickStatesBySourceId_(existingById, sourceId) {
 // ---- 実行エントリーポイント ----
 
 /**
- * PMDA回収情報 と 厚労省供給状況 の両方を取得し、information_itemsへ安全にマージする。
- * 毎朝の自動実行（トリガー）・手動実行の両方から呼ばれる。
+ * PMDA回収情報・厚労省供給状況・Mindsガイドラインお知らせの3系統を取得し、
+ * information_itemsへ安全にマージする。毎朝の自動実行（トリガー）・手動実行の両方から呼ばれる。
  *
- * ロックの取り方（v3.1で見直し）：PMDA CSV・厚労省Excelの取得はネットワーク越しで
- * 数秒〜十数秒かかることがあるため、その間ずっとロックを保持すると、その間に人間が
- * 確認ボタンを押した操作がタイムアウトしやすくなる。そこで、
+ * ロックの取り方（v3.1で見直し）：外部取得はネットワーク越しで数秒〜十数秒かかることがあるため、
+ * その間ずっとロックを保持すると、その間に人間が確認ボタンを押した操作がタイムアウトしやすくなる。
+ * そこで、
  *   1. ロックを取らずに外部データを取得する（下準備として、取得前のexistingByIdも読んでおく）
  *   2. シートの読み書きだけをロックで保護する。ロックを取った直後に existingById を
  *      読み直すことで、取得中に人間が行った変更を取りこぼさない
@@ -1619,6 +1844,7 @@ function runConvertAllToInformationItems() {
 
   var pmdaResults = fetchAllPmdaRecallSourceResults_(); // クラスI・II・IIIをそれぞれ独立して取得
   var mhlwResult = fetchMhlwSupplySourceResult_(existingMhlwStates);
+  var mindsResult = fetchMindsGuidelineSourceResult_();
 
   var lock = LockService.getScriptLock();
   var gotLock = false;
@@ -1638,7 +1864,7 @@ function runConvertAllToInformationItems() {
     // ロックを取った直後に最新状態を読み直す（取得中に行われた人間の操作を取りこぼさないため）。
     var existingById = readExistingItemsById_();
     var nowIso = new Date().toISOString();
-    var applied = applyFetchResultsToState_(existingById, pmdaResults.concat([mhlwResult]), nowIso);
+    var applied = applyFetchResultsToState_(existingById, pmdaResults.concat([mhlwResult, mindsResult]), nowIso);
 
     writeInformationItemsSheet_(applied.updatedById);
     appendHistoryEntries_(applied.historyEntries);
@@ -1652,7 +1878,9 @@ function runConvertAllToInformationItems() {
     Logger.log(
       pmdaSummary +
         ' / 厚労省供給: ' +
-        (mhlwResult.success ? '成功(' + mhlwResult.items.length + '件)' : '失敗: ' + mhlwResult.error),
+        (mhlwResult.success ? '成功(' + mhlwResult.items.length + '件)' : '失敗: ' + mhlwResult.error) +
+        ' / Mindsガイドライン: ' +
+        (mindsResult.success ? '成功(' + mindsResult.items.length + '件)' : '失敗: ' + mindsResult.error),
     );
   } finally {
     lock.releaseLock();
@@ -1700,11 +1928,69 @@ function runConvertPmdaRecallToInformationItems() {
   });
 }
 
+/**
+ * 【1回だけ実行する後片付け用】v3.2の一時的な不具合で作られてしまった、
+ * id が "pmda_recall_class1_"「pmda_recall_class2_」「pmda_recall_class3_」で
+ * 始まる重複行（本来は"pmda_recall_"のみで良かった）をinformation_itemsシートから削除する。
+ *
+ * 対象：このコード修正（id生成をsourceId無しに戻した版）を反映する前に
+ * runConvertAllToInformationItems / runConvertPmdaRecallToInformationItems を
+ * 一度でも実行したことがある場合のみ影響がある。該当行が無ければ「0件削除」と出るだけで、
+ * 何度実行しても安全（誤って余分に削除することはない）。
+ *
+ * 実行後、あらためて runConvertAllToInformationItems を実行して、
+ * クラスI・II・IIIを本来のid（pmda_recall_ + 回収番号）で正しくマージし直すこと。
+ */
+function runCleanupBuggyClassPrefixedPmdaIds() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(INFO_ITEMS_SHEET_NAME);
+  if (!sheet) {
+    Logger.log('information_itemsシートが見つかりません。何もしていません。');
+    return;
+  }
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    Logger.log('データ行がありません。何もしていません。');
+    return;
+  }
+
+  var ids = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+  var buggyIdPattern = /^pmda_recall_class[123]_/;
+  var rowsToDelete = [];
+  for (var i = 0; i < ids.length; i++) {
+    if (buggyIdPattern.test(String(ids[i][0]))) {
+      rowsToDelete.push(i + 2); // 1行目は見出しなので+2
+    }
+  }
+
+  if (rowsToDelete.length === 0) {
+    Logger.log('対象の行はありませんでした（0件削除）。既にきれいな状態か、まだこの不具合の影響を受けていません。');
+    return;
+  }
+
+  // 下の行から順に削除しないと、削除のたびに行番号がずれて別の行を消してしまう
+  for (var j = rowsToDelete.length - 1; j >= 0; j--) {
+    sheet.deleteRow(rowsToDelete[j]);
+  }
+
+  Logger.log(
+    rowsToDelete.length +
+      '件の重複行を削除しました。この後もう一度 runConvertAllToInformationItems を実行して、正しいidで再取得・マージしてください。',
+  );
+}
+
 /** 厚労省供給状況だけを取得してマージする（動作確認用の単体実行）。 */
 function runConvertMhlwSupplyToInformationItems() {
   runSingleSourceConversion_(function (preFetchExistingById) {
     var existingMhlwStates = pickStatesBySourceId_(preFetchExistingById, 'mhlw_supply');
     return [fetchMhlwSupplySourceResult_(existingMhlwStates)];
+  });
+}
+
+/** Mindsガイドラインお知らせだけを取得してマージする（動作確認用の単体実行）。 */
+function runConvertMindsGuidelineToInformationItems() {
+  runSingleSourceConversion_(function () {
+    return [fetchMindsGuidelineSourceResult_()];
   });
 }
 
