@@ -1,6 +1,20 @@
 /**
- * 医療情報ウォッチ GAS本体（v3.3）
+ * 医療情報ウォッチ GAS本体（v3.4）
  * ------------------------------------------------------------
+ * v3.3からの変更点（学会お知らせボットの追加）：
+ *   ・日本内科学会（naika_announcement）・日本糖尿病学会（jds_announcement）の
+ *     お知らせ一覧を新しい情報源として追加。他の情報源と同様、独立したsourceIdで
+ *     成功/失敗・変更検知を行うため、1情報源の取得失敗が他情報源に影響しない
+ *   ・タイトルに「ガイドライン」「ガイダンス」「指針」「ステートメント」「アルゴリズム」
+ *     「コンセンサス」「Recommendation」「分類」「基準」「マニュアル」のいずれかを
+ *     含むものだけを対象にする（専門医試験・表彰・休業案内等の事務連絡ノイズの除外）。
+ *     カテゴリはclinical、itemTypeは治療情報、重要度は一律info（参考）からスタートし、
+ *     人間が個別に確認・重要度確定する運用（Minds同様、自動判定基準が無いため）
+ *   ・Mindsと違い、これらのサイトは「日付」と「タイトルへのリンク」が別要素になっている
+ *     ため、リンクの直前にある最も近い日付をその項目の掲載日とみなす汎用パース関数
+ *     （extractDatedAnnouncementEntries_）を新設した
+ *   詳細はgas/README.mdの「v3.3→v3.4の変更点」を参照。
+ *
  * v3.2.1からの変更点（ガイドラインウォッチボットの追加）：
  *   ・Mindsガイドラインライブラリの「お知らせ」ページ（お知らせ一覧のHTML）を新しい情報源
  *     （minds_guideline）として追加。他の情報源と同様、独立したsourceIdで成功/失敗・
@@ -845,6 +859,153 @@ function buildMindsIncomingItems_(entries, listPageUrl, fetchedAtIso) {
     });
 }
 
+// ---- 学会お知らせ（日本内科学会・日本糖尿病学会）：HTML解析（GAS API非依存の純粋関数） ----
+
+/**
+ * 文字列の中から最初に見つかった日本語の日付（"YYYY年M月D日"）をISO形式（"YYYY-MM-DD"）に
+ * 変換して返す（純粋関数）。見つからなければ空文字を返す。
+ * parseMindsNewsEntryText_と似ているが、あちらは「日付+カテゴリ+タイトル」がまとまった
+ * 1つの文字列からの分離用、こちらは任意の文字列から日付だけを拾う汎用版。
+ */
+function findJapaneseDateAsIso_(text) {
+  var m = String(text || '').match(/(\d{4})年(\d{1,2})月(\d{1,2})日/);
+  if (!m) return '';
+  var y = m[1];
+  var mo = ('0' + m[2]).slice(-2);
+  var d = ('0' + m[3]).slice(-2);
+  return y + '-' + mo + '-' + d;
+}
+
+/**
+ * 学会お知らせのうち、「最新の治療法・ガイドライン系」と判定するためのキーワード一覧
+ * （フリちゃんと合意済み）。専門医試験・表彰・休業案内等の事務連絡ノイズを除外するために使う。
+ */
+var GAKKAI_TREATMENT_KEYWORDS_ = [
+  'ガイドライン',
+  'ガイダンス',
+  '指針',
+  'ステートメント',
+  'アルゴリズム',
+  'コンセンサス',
+  'Recommendation',
+  '分類',
+  '基準',
+  'マニュアル',
+];
+
+/** タイトルが上記キーワードのいずれかを含むかどうか。 */
+function isTreatmentRelatedAnnouncementTitle_(title) {
+  if (typeof title !== 'string') return false;
+  for (var i = 0; i < GAKKAI_TREATMENT_KEYWORDS_.length; i++) {
+    if (title.indexOf(GAKKAI_TREATMENT_KEYWORDS_[i]) !== -1) return true;
+  }
+  return false;
+}
+
+/**
+ * 汎用：お知らせ一覧のHTMLから、詳細ページへのリンク（linkRegexにマッチする<a>タグ）を
+ * 探し、リンクの直前にある最も近い日付（"YYYY年M月D日"）をその項目の掲載日として対応付ける
+ * （純粋関数）。日本内科学会・日本糖尿病学会のように「日付は別要素・タイトル部分だけが
+ * リンクになっている」タイプのお知らせ一覧に共通して使う（Mindsのように日付までリンクの
+ * 中に入っているケースはextractMindsNewsEntries_を使う）。
+ *
+ * linkRegexは以下の3つのキャプチャグループを持つ正規表現（globalフラグ必須）：
+ *   グループ1：詳細ページの完全なURL
+ *   グループ2：項目の一意なID（URLの一部など）
+ *   グループ3：リンクの中身（タイトルを含むHTML片）
+ * 同じidが複数回出てくる場合は最初に見つかったものだけを採用する。
+ */
+function extractDatedAnnouncementEntries_(html, linkRegex) {
+  var entries = [];
+  var seen = {};
+  var match;
+  var DATE_LOOKBACK_CHARS = 400;
+
+  while ((match = linkRegex.exec(html)) !== null) {
+    var url = match[1];
+    var id = match[2];
+    if (seen[id]) continue;
+    seen[id] = true;
+
+    var title = stripHtmlTags_(match[3]).replace(/\s+/g, ' ').trim();
+    // 「NEW!」等の装飾語をタイトル末尾から取り除く（サイトによって付くことがある）
+    title = title.replace(/\s*NEW!?\s*$/i, '').trim();
+
+    var searchStart = Math.max(0, match.index - DATE_LOOKBACK_CHARS);
+    var precedingText = html.slice(searchStart, match.index);
+    var dateMatches = precedingText.match(/\d{4}年\d{1,2}月\d{1,2}日/g);
+    var publishedAt = dateMatches && dateMatches.length > 0 ? findJapaneseDateAsIso_(dateMatches[dateMatches.length - 1]) : '';
+
+    entries.push({ id: id, url: url, title: title, publishedAt: publishedAt });
+  }
+
+  return entries;
+}
+
+/** 学会お知らせのうち、内容変更判定に使うフィールドを決まった順序の配列にする。 */
+function gakkaiAnnouncementHashFields_(f) {
+  return [f.sourceId, f.id, f.publishedAt, f.title];
+}
+
+/**
+ * 1件の学会お知らせエントリを、information_items用の「今回取得した内容」オブジェクトへ
+ * 変換する（純粋関数）。重要度は一律'info'（参考）からスタートする：Minds同様、
+ * 学会お知らせにも自動判定できる分類が無いため、人間が個別に確認・重要度確定する運用。
+ */
+function buildGakkaiAnnouncementItem_(sourceId, sourceLabel, entry, fetchedAtIso) {
+  var contentHash = computeContentHash_(
+    gakkaiAnnouncementHashFields_({
+      sourceId: sourceId,
+      id: entry.id,
+      publishedAt: entry.publishedAt,
+      title: entry.title,
+    }),
+  );
+
+  return {
+    id: sourceId + '_' + entry.id,
+    sourceRecordId: entry.id,
+    category: 'clinical',
+    itemType: '治療情報',
+    title: sanitizeCellValue_(entry.title),
+    summary: sanitizeCellValue_(entry.title),
+    aiImportance: 'info',
+    publishedAt: entry.publishedAt,
+    sourceName: sanitizeCellValue_(sourceLabel + '（お知らせ）'),
+    documentNumber: null,
+    pharmacyImpact: '',
+    requiredAction: null,
+    primaryUrl: entry.url,
+    remarks: '',
+    contentHash: contentHash,
+    fetchedAtIso: fetchedAtIso,
+  };
+}
+
+/**
+ * お知らせ一覧の全エントリから、GAKKAI_TREATMENT_KEYWORDS_のいずれかをタイトルに
+ * 含むものだけをinformation_items用オブジェクトの配列に変換する（純粋関数）。
+ */
+function buildGakkaiIncomingItems_(sourceId, sourceLabel, entries, fetchedAtIso) {
+  return entries
+    .filter(function (entry) {
+      return isTreatmentRelatedAnnouncementTitle_(entry.title);
+    })
+    .map(function (entry) {
+      return buildGakkaiAnnouncementItem_(sourceId, sourceLabel, entry, fetchedAtIso);
+    });
+}
+
+/** 日本内科学会お知らせ（naika.or.jp/info/以下）の詳細リンクにマッチする正規表現を作る。 */
+function buildNaikaAnnouncementLinkRegex_() {
+  return /<a\b[^>]*href="(https:\/\/www\.naika\.or\.jp\/info\/([a-zA-Z0-9_-]+)\/)"[^>]*>([\s\S]*?)<\/a>/gi;
+}
+
+/** 日本糖尿病学会お知らせ（jds.or.jp/modules/important/以下）の詳細リンクにマッチする正規表現を作る。 */
+function buildJdsAnnouncementLinkRegex_() {
+  return /<a\b[^>]*href="(https:\/\/www\.jds\.or\.jp\/modules\/important\/index\.php\?content_id=(\d+))"[^>]*>([\s\S]*?)<\/a>/gi;
+}
+
 // ---- 変更検知・マージ（データ消失防止の中心ロジック） ----
 
 /**
@@ -1109,10 +1270,11 @@ function applyFetchResultsToState_(existingById, fetchResults, nowIso) {
   return { updatedById: updatedById, historyEntries: historyEntries, runLogs: runLogs };
 }
 
-/** itemType（'回収' / '供給' / 'ガイドライン' 等）から、リンクの見出しに使うラベルを決める。 */
+/** itemType（'回収' / '供給' / 'ガイドライン' / '治療情報' 等）から、リンクの見出しに使うラベルを決める。 */
 function linkLabelForItemType_(itemType) {
   if (itemType === '供給') return '厚労省 医療用医薬品供給状況（Excel原本）';
   if (itemType === 'ガイドライン') return 'Minds お知らせページ（原文）';
+  if (itemType === '治療情報') return '学会お知らせページ（原文）';
   return 'PMDA 回収情報一覧（原文）';
 }
 
@@ -1199,6 +1361,8 @@ var SOURCE_LABELS_ = {
   pmda_recall_class3: 'PMDA回収情報（クラスIII）',
   mhlw_supply: '厚労省供給情報',
   minds_guideline: 'Mindsガイドライン',
+  naika_announcement: '日本内科学会お知らせ',
+  jds_announcement: '日本糖尿病学会お知らせ',
 };
 
 // 旧バージョン（v2）が使っていた「情報アイテム変換結果」シート関連
@@ -1822,6 +1986,79 @@ function pickStatesBySourceId_(existingById, sourceId) {
   return result;
 }
 
+// ---- 学会お知らせ（日本内科学会・日本糖尿病学会）：ネットワーク取得（GAS依存） ----
+
+var NAIKA_INFO_LIST_URL = 'https://www.naika.or.jp/info/';
+var JDS_ANNOUNCEMENT_LIST_URL = 'https://www.jds.or.jp/modules/important_list/index.php?content_id=1';
+
+/**
+ * 学会お知らせ一覧を取得し、{ sourceId, success, items, fetchedAt, error } の形で返す
+ * 汎用関数（日本内科学会・日本糖尿病学会で共通）。他の情報源と同様、独立したsourceIdとして
+ * 成功/失敗を記録するため、1情報源の取得失敗・ページ構成変更が他情報源に影響しない。
+ * maxCountで取得件数の上限を切る（日本糖尿病学会のお知らせ一覧は過去分まで1ページに
+ * まとまって表示されるため、初回実行で大量の古いお知らせを取り込みすぎないようにする）。
+ */
+function fetchGakkaiAnnouncementSourceResult_(sourceId, sourceLabel, listUrl, linkRegex, maxCount) {
+  var startedAt = new Date().toISOString();
+  try {
+    var response = UrlFetchApp.fetch(listUrl, { muteHttpExceptions: true, followRedirects: true });
+    var code = response.getResponseCode();
+    if (code !== 200) {
+      return {
+        sourceId: sourceId,
+        success: false,
+        items: [],
+        fetchedAt: new Date().toISOString(),
+        startedAt: startedAt,
+        error: sourceLabel + 'のお知らせ一覧ページの取得に失敗しました（HTTP ' + code + '）',
+      };
+    }
+
+    var html = response.getContentText('UTF-8');
+    var entries = extractDatedAnnouncementEntries_(html, linkRegex);
+    if (maxCount) entries = entries.slice(0, maxCount);
+    if (entries.length === 0) {
+      Logger.log(sourceLabel + 'のお知らせ一覧からリンクを1件も抽出できませんでした。ページ構成が変わった可能性があります。');
+    }
+
+    var fetchedAtIso = new Date().toISOString();
+    var items = buildGakkaiIncomingItems_(sourceId, sourceLabel, entries, fetchedAtIso);
+
+    return { sourceId: sourceId, success: true, items: items, fetchedAt: fetchedAtIso, startedAt: startedAt, error: null };
+  } catch (e) {
+    return {
+      sourceId: sourceId,
+      success: false,
+      items: [],
+      fetchedAt: new Date().toISOString(),
+      startedAt: startedAt,
+      error: sourceLabel + 'のお知らせ取得・解析中にエラー: ' + e,
+    };
+  }
+}
+
+/** 日本内科学会お知らせを取得する（最新20件まで）。 */
+function fetchNaikaAnnouncementSourceResult_() {
+  return fetchGakkaiAnnouncementSourceResult_(
+    'naika_announcement',
+    '日本内科学会',
+    NAIKA_INFO_LIST_URL,
+    buildNaikaAnnouncementLinkRegex_(),
+    20,
+  );
+}
+
+/** 日本糖尿病学会お知らせを取得する（最新30件まで。過去分まで1ページに載るページのため上限を切る）。 */
+function fetchJdsAnnouncementSourceResult_() {
+  return fetchGakkaiAnnouncementSourceResult_(
+    'jds_announcement',
+    '日本糖尿病学会',
+    JDS_ANNOUNCEMENT_LIST_URL,
+    buildJdsAnnouncementLinkRegex_(),
+    30,
+  );
+}
+
 // ---- 実行エントリーポイント ----
 
 /**
@@ -1845,6 +2082,8 @@ function runConvertAllToInformationItems() {
   var pmdaResults = fetchAllPmdaRecallSourceResults_(); // クラスI・II・IIIをそれぞれ独立して取得
   var mhlwResult = fetchMhlwSupplySourceResult_(existingMhlwStates);
   var mindsResult = fetchMindsGuidelineSourceResult_();
+  var naikaResult = fetchNaikaAnnouncementSourceResult_();
+  var jdsResult = fetchJdsAnnouncementSourceResult_();
 
   var lock = LockService.getScriptLock();
   var gotLock = false;
@@ -1864,7 +2103,11 @@ function runConvertAllToInformationItems() {
     // ロックを取った直後に最新状態を読み直す（取得中に行われた人間の操作を取りこぼさないため）。
     var existingById = readExistingItemsById_();
     var nowIso = new Date().toISOString();
-    var applied = applyFetchResultsToState_(existingById, pmdaResults.concat([mhlwResult, mindsResult]), nowIso);
+    var applied = applyFetchResultsToState_(
+      existingById,
+      pmdaResults.concat([mhlwResult, mindsResult, naikaResult, jdsResult]),
+      nowIso,
+    );
 
     writeInformationItemsSheet_(applied.updatedById);
     appendHistoryEntries_(applied.historyEntries);
@@ -1880,7 +2123,11 @@ function runConvertAllToInformationItems() {
         ' / 厚労省供給: ' +
         (mhlwResult.success ? '成功(' + mhlwResult.items.length + '件)' : '失敗: ' + mhlwResult.error) +
         ' / Mindsガイドライン: ' +
-        (mindsResult.success ? '成功(' + mindsResult.items.length + '件)' : '失敗: ' + mindsResult.error),
+        (mindsResult.success ? '成功(' + mindsResult.items.length + '件)' : '失敗: ' + mindsResult.error) +
+        ' / 日本内科学会: ' +
+        (naikaResult.success ? '成功(' + naikaResult.items.length + '件)' : '失敗: ' + naikaResult.error) +
+        ' / 日本糖尿病学会: ' +
+        (jdsResult.success ? '成功(' + jdsResult.items.length + '件)' : '失敗: ' + jdsResult.error),
     );
   } finally {
     lock.releaseLock();
@@ -1991,6 +2238,20 @@ function runConvertMhlwSupplyToInformationItems() {
 function runConvertMindsGuidelineToInformationItems() {
   runSingleSourceConversion_(function () {
     return [fetchMindsGuidelineSourceResult_()];
+  });
+}
+
+/** 日本内科学会お知らせだけを取得してマージする（動作確認用の単体実行）。 */
+function runConvertNaikaAnnouncementToInformationItems() {
+  runSingleSourceConversion_(function () {
+    return [fetchNaikaAnnouncementSourceResult_()];
+  });
+}
+
+/** 日本糖尿病学会お知らせだけを取得してマージする（動作確認用の単体実行）。 */
+function runConvertJdsAnnouncementToInformationItems() {
+  runSingleSourceConversion_(function () {
+    return [fetchJdsAnnouncementSourceResult_()];
   });
 }
 

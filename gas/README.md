@@ -1,4 +1,4 @@
-# GAS実装（v3.3）
+# GAS実装（v3.4）
 
 `pmda-recall-fetcher.gs` 1ファイルに、データ取得・変更検知・Web App化・定期実行のすべてが入っている（フリちゃんが「ファイルを丸ごと貼り替える」運用のため、あえて単一ファイル構成にしている）。
 
@@ -30,6 +30,15 @@ v3からの変更点（2次監査対応）は本ファイル末尾の「v3→v3.
 - カテゴリは`clinical`（治療・臨床ウォッチ、`watch_clinical`）に固定。重要度は一律`info`（参考）からスタートし、Minds側にはPMDAの回収クラスのような自動判定基準が無いため、人間が個別に確認・重要度確定する運用。
 - 一覧ページのHTML構造に依存したパース（`extractMindsNewsEntries_`）のため、Minds側でページのマークアップが大きく変わると抽出できなくなる可能性がある。その場合は`fetchMindsGuidelineSourceResult_`が「取得0件」または失敗として`source_run_logs`に記録されるので、そこで気づける（他の情報源には影響しない）。
 
+### 学会お知らせ（日本内科学会・日本糖尿病学会、v3.4で追加）
+
+- 日本内科学会（`https://www.naika.or.jp/info/`、最新20件まで）・日本糖尿病学会（`https://www.jds.or.jp/modules/important_list/index.php?content_id=1`、最新30件まで）それぞれの「お知らせ一覧」をHTML取得・パースする。日本糖尿病学会側は過去分まで1ページに表示されるため、`maxCount`で取得件数の上限を切っている。
+- Mindsとは異なり、これらのサイトは「日付」と「タイトルへのリンク」が別要素になっている（日付がリンクの外側にある）。そのため`extractDatedAnnouncementEntries_`という汎用パース関数を新設し、詳細ページへのリンクの直前にある最も近い日付をその項目の掲載日とみなす方式にしている。
+- タイトルに **「ガイドライン」「ガイダンス」「指針」「ステートメント」「アルゴリズム」「コンセンサス」「Recommendation」「分類」「基準」「マニュアル」** のいずれかを含むものだけを対象にする（`GAKKAI_TREATMENT_KEYWORDS_`で定義。フリちゃんと合意済み）。専門医試験・表彰・休業案内・医薬品の出荷停止/供給再開のお知らせ（PMDA・厚労省側と重複しうる）等の事務連絡ノイズを除外するため。
+- カテゴリは`clinical`（治療・臨床ウォッチ）、itemTypeは`治療情報`に固定。重要度は一律`info`（参考）からスタートし、Minds同様、自動判定基準が無いため人間が個別に確認・重要度確定する運用。
+- キーワードセットは初回実装時点の暫定案。実際に取れた件数・中身を見ながら追加・削除して調整していく想定（`GAKKAI_TREATMENT_KEYWORDS_`を編集するだけでよい）。
+- 一覧ページのHTML構造に依存したパースのため、各学会側でページのマークアップが大きく変わると抽出できなくなる可能性がある。その場合は`fetchNaikaAnnouncementSourceResult_`・`fetchJdsAnnouncementSourceResult_`が「取得0件」または失敗として`source_run_logs`に記録されるので、そこで気づける（他の情報源には影響しない）。
+
 ## データの構造
 
 Googleスプレッドシート内に3つのシートを持つ。
@@ -38,7 +47,7 @@ Googleスプレッドシート内に3つのシートを持つ。
 | --- | --- |
 | `information_items` | 現在の状態（1id=1行）。人間の確認状態・重要度・HOME表示・変更検知用のハッシュ・欠落回数を含む |
 | `information_item_history` | 内容変更・供給再開・掲載未確認を検知するたびに追記される変更履歴 |
-| `source_run_logs` | 情報源（PMDA／厚労省／Minds）ごとの実行結果（成功/失敗・件数・エラー内容）のログ |
+| `source_run_logs` | 情報源（PMDA／厚労省／Minds／学会お知らせ）ごとの実行結果（成功/失敗・件数・エラー内容）のログ |
 
 v2までの「情報アイテム変換結果」シートは削除しない。初回実行時に自動移行され、「旧_情報アイテム変換結果」という名前でそのまま残る（詳細は後述）。
 
@@ -124,6 +133,8 @@ PMDA CSV・厚労省Excelから取得した文字列のうち、先頭が `=` `+
 - `runConvertPmdaRecallToInformationItems`：PMDAだけ取得してマージ
 - `runConvertMhlwSupplyToInformationItems`：厚労省供給状況だけ取得してマージ
 - `runConvertMindsGuidelineToInformationItems`：Mindsガイドラインお知らせだけ取得してマージ
+- `runConvertNaikaAnnouncementToInformationItems`：日本内科学会お知らせだけ取得してマージ
+- `runConvertJdsAnnouncementToInformationItems`：日本糖尿病学会お知らせだけ取得してマージ
 - `runPmdaRecallCsvPoc`：`information_items` の仕組みとは独立した、PMDA CSVの生データ確認用（`PMDA_回収情報_PoC`シート）
 - `listTriggers` / `setupDailyTrigger` / `removeDailyTrigger`：定期実行トリガーの確認・設定・削除
 
@@ -164,6 +175,18 @@ Mindsガイドラインライブラリ（公益財団法人日本医療機能評
 - 単体デバッグ実行用に`runConvertMindsGuidelineToInformationItems`を追加した
 - HTML解析はGAS API非依存の純粋関数（`stripHtmlTags_` / `parseMindsNewsEntryText_` / `extractMindsNewsEntries_` / `isGuidelineNewsTitle_` / `buildMindsGuidelineItem_` / `buildMindsIncomingItems_`）として実装し、`test/gas-pure-logic.test.mjs`でテストしている
 - 一覧ページの実際のHTML構造（クラス名など）は未確認のまま実装している。href（`/news-{数字}/`）というURLパターンだけを頼りに抽出するようにして構造変化に強くしてあるが、**初回実行後は`information_items`シートに実際に「ガイドライン」アイテムが正しく登録されているか、フリちゃんの環境で必ず確認してほしい**（0件のままなら`source_run_logs`のエラー内容を確認）
+
+## v3.3→v3.4の変更点（学会お知らせボットの追加）
+
+日本内科学会・日本糖尿病学会の「お知らせ一覧」を新しい情報源（`naika_announcement`／`jds_announcement`）として追加した。詳細は上の「取得している情報」内の該当節を参照。
+
+- 「学会で話されている最新の治療トレンドを拾いたい」という要望から出発したが、CareNet・Medical Tribune等の医療ニュースサイトは無料会員登録が必須で自動取得の対象にできなかったため、学会公式サイトのお知らせページを情報源とする方針に変更した（フリちゃんと合意済み）
+- 他の情報源と同様、独立したsourceId・`source_run_logs`エントリを持つため、この情報源の取得失敗・ページ構成変更が他情報源に影響することはない
+- `runConvertAllToInformationItems`（毎朝の自動実行）が5情報源（PMDA・厚労省・Minds・日本内科学会・日本糖尿病学会）すべてを取得するようになった
+- 単体デバッグ実行用に`runConvertNaikaAnnouncementToInformationItems`・`runConvertJdsAnnouncementToInformationItems`を追加した
+- HTML解析はGAS API非依存の純粋関数（`findJapaneseDateAsIso_` / `isTreatmentRelatedAnnouncementTitle_` / `extractDatedAnnouncementEntries_` / `buildNaikaAnnouncementLinkRegex_` / `buildJdsAnnouncementLinkRegex_` / `buildGakkaiAnnouncementItem_` / `buildGakkaiIncomingItems_`）として実装し、`test/gas-pure-logic.test.mjs`でテストしている
+- 一覧ページの実際のHTML構造は未確認のまま実装している。href（`/info/{slug}/`・`?content_id={数字}`）というURLパターンと、リンク直前の日付テキストだけを頼りに抽出するようにして構造変化に強くしてあるが、**初回実行後は`information_items`シートに実際にそれらしい「治療情報」アイテムが正しく登録されているか、フリちゃんの環境で必ず確認してほしい**（0件のままなら`source_run_logs`のエラー内容を確認）
+- キーワードによる絞り込み（`GAKKAI_TREATMENT_KEYWORDS_`）は初回実装時点の暫定案。実際の取得結果を見ながら調整していく想定
 
 ## 次のステップ
 

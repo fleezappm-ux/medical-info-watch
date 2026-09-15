@@ -804,3 +804,136 @@ describe('linkLabelForItemType_（ガイドライン追加分）', () => {
     expect(gas.linkLabelForItemType_('ガイドライン')).toBe('Minds お知らせページ（原文）')
   })
 })
+
+describe('findJapaneseDateAsIso_', () => {
+  it('日本語の日付をISO形式に変換する', () => {
+    expect(gas.findJapaneseDateAsIso_('2026年9月7日')).toBe('2026-09-07')
+  })
+
+  it('前後にテキストがあっても最初の日付を拾う', () => {
+    expect(gas.findJapaneseDateAsIso_('お知らせ 2026年1月5日 掲載')).toBe('2026-01-05')
+  })
+
+  it('日付が無ければ空文字を返す', () => {
+    expect(gas.findJapaneseDateAsIso_('日付なしのテキスト')).toBe('')
+    expect(gas.findJapaneseDateAsIso_(null)).toBe('')
+  })
+})
+
+describe('isTreatmentRelatedAnnouncementTitle_', () => {
+  it('合意済みキーワードのいずれかを含めばtrue', () => {
+    expect(gas.isTreatmentRelatedAnnouncementTitle_('「2型糖尿病の薬物療法のアルゴリズム（第2版）」を発表しました')).toBe(true)
+    expect(gas.isTreatmentRelatedAnnouncementTitle_('自動インスリン注入デバイス適正使用指針について')).toBe(true)
+    expect(gas.isTreatmentRelatedAnnouncementTitle_('「女性のヘルスケアに関するガイダンス（中高年編）」を策定しました')).toBe(true)
+    expect(gas.isTreatmentRelatedAnnouncementTitle_('糖尿病性腎症病期分類2023の策定')).toBe(true)
+  })
+
+  it('事務連絡ノイズはfalse', () => {
+    expect(gas.isTreatmentRelatedAnnouncementTitle_('第37回（2026年度）糖尿病専門医受験予定の皆さまへ')).toBe(false)
+    expect(gas.isTreatmentRelatedAnnouncementTitle_('事務局の年末年始休業について')).toBe(false)
+    expect(gas.isTreatmentRelatedAnnouncementTitle_('「第12回若手研究助成金」：受賞者10名が決まりました')).toBe(false)
+  })
+
+  it('文字列以外はfalse', () => {
+    expect(gas.isTreatmentRelatedAnnouncementTitle_(null)).toBe(false)
+    expect(gas.isTreatmentRelatedAnnouncementTitle_(undefined)).toBe(false)
+  })
+})
+
+describe('extractDatedAnnouncementEntries_ / buildNaikaAnnouncementLinkRegex_', () => {
+  const naikaSampleHtml = `
+    <li>
+      2026年09月01日
+      <a href="https://www.naika.or.jp/info-cat/announcement/">日本内科学会</a>
+      <a href="https://www.naika.or.jp/info/20260901/"><strong>内科医リカレント教育 オンラインカンファレンス開催のお知らせ</strong></a>
+    </li>
+    <li>
+      2026年07月23日
+      <a href="https://www.naika.or.jp/info-cat/related/">関連学会・団体等</a>
+      <a href="https://www.naika.or.jp/info/20260723/">「女性のヘルスケアに関するガイダンス（中高年編）」を策定しました</a>
+    </li>
+  `
+
+  it('日付が別要素でもリンク直前の日付を対応付けて抽出する', () => {
+    const entries = gas.extractDatedAnnouncementEntries_(naikaSampleHtml, gas.buildNaikaAnnouncementLinkRegex_())
+    expect(entries).toHaveLength(2)
+    expect(entries[0]).toEqual({
+      id: '20260901',
+      url: 'https://www.naika.or.jp/info/20260901/',
+      title: '内科医リカレント教育 オンラインカンファレンス開催のお知らせ',
+      publishedAt: '2026-09-01',
+    })
+    expect(entries[1].title).toBe('「女性のヘルスケアに関するガイダンス（中高年編）」を策定しました')
+    expect(entries[1].publishedAt).toBe('2026-07-23')
+  })
+
+  it('info-cat/へのカテゴリリンクは詳細リンクとして拾わない', () => {
+    const entries = gas.extractDatedAnnouncementEntries_(naikaSampleHtml, gas.buildNaikaAnnouncementLinkRegex_())
+    expect(entries.some((e) => e.url.indexOf('info-cat') !== -1)).toBe(false)
+  })
+
+  it('同じidへの重複リンクは1件だけ採用する', () => {
+    const dup = naikaSampleHtml + '<a href="https://www.naika.or.jp/info/20260901/">重複</a>'
+    const entries = gas.extractDatedAnnouncementEntries_(dup, gas.buildNaikaAnnouncementLinkRegex_())
+    expect(entries.filter((e) => e.id === '20260901')).toHaveLength(1)
+  })
+})
+
+describe('extractDatedAnnouncementEntries_ / buildJdsAnnouncementLinkRegex_', () => {
+  const jdsSampleHtml = `
+    <li>2026年09月07日
+      <a href="https://www.jds.or.jp/modules/important/index.php?content_id=546">先進糖尿病テクノロジーに関する研修（eラーニング2コース）を公開しました NEW!</a>
+    </li>
+    <li>2026年08月26日
+      <a href="https://www.jds.or.jp/modules/important/index.php?content_id=541">制吐薬適正使用ガイドライン速報発信のお知らせ</a>
+    </li>
+  `
+
+  it('末尾の"NEW!"を取り除いてタイトルを抽出する', () => {
+    const entries = gas.extractDatedAnnouncementEntries_(jdsSampleHtml, gas.buildJdsAnnouncementLinkRegex_())
+    const first = entries.find((e) => e.id === '546')
+    expect(first.title).toBe('先進糖尿病テクノロジーに関する研修（eラーニング2コース）を公開しました')
+    expect(first.publishedAt).toBe('2026-09-07')
+  })
+
+  it('ガイドライン系のタイトルもそのまま拾える', () => {
+    const entries = gas.extractDatedAnnouncementEntries_(jdsSampleHtml, gas.buildJdsAnnouncementLinkRegex_())
+    const second = entries.find((e) => e.id === '541')
+    expect(second.title).toBe('制吐薬適正使用ガイドライン速報発信のお知らせ')
+  })
+})
+
+describe('buildGakkaiIncomingItems_ / buildGakkaiAnnouncementItem_', () => {
+  const entries = [
+    { id: '541', url: 'https://www.jds.or.jp/modules/important/index.php?content_id=541', title: '制吐薬適正使用ガイドライン速報発信のお知らせ', publishedAt: '2026-08-26' },
+    { id: '540', url: 'https://www.jds.or.jp/modules/important/index.php?content_id=540', title: '「若手グループコミュニティプロジェクト」の活動報告を掲載しました', publishedAt: '2026-08-21' },
+  ]
+
+  it('キーワードを含むものだけをアイテムに変換する', () => {
+    const items = gas.buildGakkaiIncomingItems_('jds_announcement', '日本糖尿病学会', entries, '2026-09-14T00:00:00.000Z')
+    expect(items).toHaveLength(1)
+    expect(items[0].id).toBe('jds_announcement_541')
+  })
+
+  it('category=clinical、itemType=治療情報、重要度は一律info', () => {
+    const item = gas.buildGakkaiAnnouncementItem_('jds_announcement', '日本糖尿病学会', entries[0], '2026-09-14T00:00:00.000Z')
+    expect(item.category).toBe('clinical')
+    expect(item.itemType).toBe('治療情報')
+    expect(item.aiImportance).toBe('info')
+    expect(item.sourceRecordId).toBe('541')
+    expect(item.primaryUrl).toBe(entries[0].url)
+    expect(item.sourceName).toBe('日本糖尿病学会（お知らせ）')
+  })
+
+  it('sourceIdが異なれば同じ元idでもitem idは衝突しない', () => {
+    const jdsItem = gas.buildGakkaiAnnouncementItem_('jds_announcement', '日本糖尿病学会', entries[0], 't')
+    const naikaItem = gas.buildGakkaiAnnouncementItem_('naika_announcement', '日本内科学会', entries[0], 't')
+    expect(jdsItem.id).not.toBe(naikaItem.id)
+  })
+})
+
+describe('linkLabelForItemType_（治療情報追加分）', () => {
+  it("itemType '治療情報' は学会お知らせのラベルを返す", () => {
+    expect(gas.linkLabelForItemType_('治療情報')).toBe('学会お知らせページ（原文）')
+  })
+})
