@@ -23,6 +23,11 @@ const API_URL_STORAGE_KEY = 'medical-info-watch:apiUrl'
 function App() {
   const [items, setItems] = useState(mockItems)
   const [isRealData, setIsRealData] = useState(false)
+  // 実データ取得中かどうか（自動読み込み・手動読み込み共通）。GASのWeb Appは初回アクセス時に
+  // 数秒〜十数秒かかることがあり、これが無いと「モックデータ表示中」の文言が変わらないまま
+  // 固まっているように見えてしまう（実際に起きた混乱：フリちゃんが自動読み込みを「反応していない」
+  // と感じ、手動ボタンを押して初めて切り替わったように見えた）。
+  const [isLoading, setIsLoading] = useState(false)
   const [watchSettings, setWatchSettings] = useState(mockWatchSettings)
   const [sourceStatuses, setSourceStatuses] = useState<SourceStatus[]>([])
   const [apiUrl, setApiUrl] = useState(() => {
@@ -70,13 +75,18 @@ function App() {
   // 直前に変更した内容がまだサーバーに届く前に古い状態で上書きされるのを防ぐ。
   async function loadRealData(url: string) {
     await syncQueueRef.current
-    const data = await fetchInformationItemsFromApi(url)
-    setItems(data.items)
-    setIsRealData(true)
-    if (data.watchSettings) {
-      setWatchSettings(data.watchSettings)
+    setIsLoading(true)
+    try {
+      const data = await fetchInformationItemsFromApi(url)
+      setItems(data.items)
+      setIsRealData(true)
+      if (data.watchSettings) {
+        setWatchSettings(data.watchSettings)
+      }
+      setSourceStatuses(data.sourceStatuses ?? [])
+    } finally {
+      setIsLoading(false)
     }
-    setSourceStatuses(data.sourceStatuses ?? [])
   }
 
   // ページを開いた時点で保存済みのURLがあれば、自動で実データを読み込む。
@@ -188,9 +198,11 @@ function App() {
       <Header facilityName={FACILITY_NAME} items={items} />
 
       <div className="mock-banner">
-        {isRealData
-          ? 'PMDA実データ表示中（Google Apps Script経由）'
-          : 'モックデータ表示中：実データ取得はまだ接続されていません'}
+        {isLoading
+          ? '実データを読み込み中…（初回アクセス時はGoogle Apps Script側の起動に数秒〜十数秒かかることがあります）'
+          : isRealData
+            ? '実データ表示中（Google Apps Script経由）'
+            : 'モックデータ表示中：実データ取得はまだ接続されていません'}
       </div>
 
       {syncError && (
