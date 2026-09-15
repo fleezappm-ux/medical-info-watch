@@ -1,6 +1,21 @@
 /**
- * 医療情報ウォッチ GAS本体（v3.4）
+ * 医療情報ウォッチ GAS本体（v3.5）
  * ------------------------------------------------------------
+ * v3.4からの変更点（薬機法等の法的関連情報ボットの追加）：
+ *   ・厚生労働省「報道発表資料」月別一覧（mhlw_houdou）を新しい情報源として追加。
+ *     他の情報源と同様、独立したsourceIdで成功/失敗・変更検知を行うため、
+ *     1情報源の取得失敗が他情報源に影響しない
+ *   ・このページは雇用・年金・介護・感染症等あらゆる分野の発表が混ざっているため、
+ *     タイトルに「薬機法」「医薬品」「医療機器」「薬事」「調剤」「薬局」「処方箋」
+ *     「医薬部外品」「再生医療等製品」「省令」「告示」のいずれかを含むものだけを
+ *     対象にする（MHLW_LEGAL_KEYWORDS_で定義。フリちゃんと合意済み）
+ *   ・カテゴリはpharmacy、itemTypeは行政通知に固定。重要度は一律info（参考）から
+ *     スタートし、他のお知らせ系ボットと同様、人間が個別に確認・重要度確定する運用
+ *   ・報道発表一覧のURLは月ごとに変わる（houdou_list_YYYYMM.html）ため、日付から
+ *     当月・前月のURLを自動算出する（PMDAの年度計算と同じ考え方。月初めでまだ
+ *     当月ページが無い場合に備えて前月にもフォールバックする）
+ *   詳細はgas/README.mdの「v3.4→v3.5の変更点」を参照。
+ *
  * v3.3からの変更点（学会お知らせボットの追加）：
  *   ・日本内科学会（naika_announcement）・日本糖尿病学会（jds_announcement）の
  *     お知らせ一覧を新しい情報源として追加。他の情報源と同様、独立したsourceIdで
@@ -1006,6 +1021,118 @@ function buildJdsAnnouncementLinkRegex_() {
   return /<a\b[^>]*href="(https:\/\/www\.jds\.or\.jp\/modules\/important\/index\.php\?content_id=(\d+))"[^>]*>([\s\S]*?)<\/a>/gi;
 }
 
+// ---- 厚労省報道発表（薬機法等の法的関連情報）：HTML解析（GAS API非依存の純粋関数） ----
+
+/** 年・月を"YYYYMM"形式の文字列にする（1桁月は0埋め）。 */
+function formatYearMonth_(year, month) {
+  var mm = month < 10 ? '0' + month : String(month);
+  return String(year) + mm;
+}
+
+/**
+ * 厚労省「報道発表資料」月別一覧ページ（houdou_list_YYYYMM.html）のURLに使う
+ * "YYYYMM"候補を、当月→前月の順で返す（純粋関数）。月初めでまだ当月のページが
+ * 作成されていない場合に備えて、前月もフォールバック候補にする
+ * （PMDAの年度計算と同じ考え方）。日本時間で年月を算出する。
+ */
+function mhlwHoudouYearMonthCandidates_(date) {
+  var d = date || new Date();
+  var jst = new Date(d.getTime() + 9 * 60 * 60 * 1000);
+  var year = jst.getUTCFullYear();
+  var month = jst.getUTCMonth() + 1; // 1-12
+
+  var prevMonth = month - 1;
+  var prevYear = year;
+  if (prevMonth < 1) {
+    prevMonth = 12;
+    prevYear = year - 1;
+  }
+
+  return [formatYearMonth_(year, month), formatYearMonth_(prevYear, prevMonth)];
+}
+
+/**
+ * 厚労省報道発表のうち、「薬機法等の法的関連情報」と判定するためのキーワード一覧
+ * （フリちゃんと合意済み）。報道発表資料は雇用・年金・介護・感染症等あらゆる分野が
+ * 混ざっているため、薬事・薬局関連の語を含むものだけに絞り込む。
+ */
+var MHLW_LEGAL_KEYWORDS_ = [
+  '薬機法',
+  '医薬品',
+  '医療機器',
+  '薬事',
+  '調剤',
+  '薬局',
+  '処方箋',
+  '医薬部外品',
+  '再生医療等製品',
+  '省令',
+  '告示',
+];
+
+/** タイトルが上記キーワードのいずれかを含むかどうか。 */
+function isLegalRelatedAnnouncementTitle_(title) {
+  if (typeof title !== 'string') return false;
+  for (var i = 0; i < MHLW_LEGAL_KEYWORDS_.length; i++) {
+    if (title.indexOf(MHLW_LEGAL_KEYWORDS_[i]) !== -1) return true;
+  }
+  return false;
+}
+
+/** 厚労省報道発表資料（/stf/newpage_{数字}.html）の詳細リンクにマッチする正規表現を作る。 */
+function buildMhlwHoudouLinkRegex_() {
+  return /<a\b[^>]*href="(https:\/\/www\.mhlw\.go\.jp\/stf\/newpage_(\d+)\.html)"[^>]*>([\s\S]*?)<\/a>/gi;
+}
+
+/** 厚労省報道発表のうち、内容変更判定に使うフィールドを決まった順序の配列にする。 */
+function mhlwHoudouHashFields_(f) {
+  return [f.id, f.publishedAt, f.title];
+}
+
+/**
+ * 1件の厚労省報道発表エントリを、information_items用の「今回取得した内容」オブジェクトへ
+ * 変換する（純粋関数）。重要度は一律'info'（参考）からスタートする：他の学会お知らせ等と
+ * 同様、自動判定できる分類が無いため、人間が個別に確認・重要度確定する運用。
+ */
+function buildMhlwHoudouItem_(entry, fetchedAtIso) {
+  var contentHash = computeContentHash_(
+    mhlwHoudouHashFields_({ id: entry.id, publishedAt: entry.publishedAt, title: entry.title }),
+  );
+
+  return {
+    id: 'mhlw_houdou_' + entry.id,
+    sourceRecordId: entry.id,
+    category: 'pharmacy',
+    itemType: '行政通知',
+    title: sanitizeCellValue_(entry.title),
+    summary: sanitizeCellValue_(entry.title),
+    aiImportance: 'info',
+    publishedAt: entry.publishedAt,
+    sourceName: '厚生労働省（報道発表資料）',
+    documentNumber: null,
+    pharmacyImpact: '',
+    requiredAction: null,
+    primaryUrl: entry.url,
+    remarks: '',
+    contentHash: contentHash,
+    fetchedAtIso: fetchedAtIso,
+  };
+}
+
+/**
+ * 報道発表一覧の全エントリから、MHLW_LEGAL_KEYWORDS_のいずれかをタイトルに含むものだけを
+ * information_items用オブジェクトの配列に変換する（純粋関数）。
+ */
+function buildMhlwHoudouIncomingItems_(entries, fetchedAtIso) {
+  return entries
+    .filter(function (entry) {
+      return isLegalRelatedAnnouncementTitle_(entry.title);
+    })
+    .map(function (entry) {
+      return buildMhlwHoudouItem_(entry, fetchedAtIso);
+    });
+}
+
 // ---- 変更検知・マージ（データ消失防止の中心ロジック） ----
 
 /**
@@ -1270,11 +1397,12 @@ function applyFetchResultsToState_(existingById, fetchResults, nowIso) {
   return { updatedById: updatedById, historyEntries: historyEntries, runLogs: runLogs };
 }
 
-/** itemType（'回収' / '供給' / 'ガイドライン' / '治療情報' 等）から、リンクの見出しに使うラベルを決める。 */
+/** itemType（'回収' / '供給' / 'ガイドライン' / '治療情報' / '行政通知' 等）から、リンクの見出しに使うラベルを決める。 */
 function linkLabelForItemType_(itemType) {
   if (itemType === '供給') return '厚労省 医療用医薬品供給状況（Excel原本）';
   if (itemType === 'ガイドライン') return 'Minds お知らせページ（原文）';
   if (itemType === '治療情報') return '学会お知らせページ（原文）';
+  if (itemType === '行政通知') return '厚労省 報道発表資料（原文）';
   return 'PMDA 回収情報一覧（原文）';
 }
 
@@ -1363,6 +1491,7 @@ var SOURCE_LABELS_ = {
   minds_guideline: 'Mindsガイドライン',
   naika_announcement: '日本内科学会お知らせ',
   jds_announcement: '日本糖尿病学会お知らせ',
+  mhlw_houdou: '厚労省報道発表（薬機法等）',
 };
 
 // 旧バージョン（v2）が使っていた「情報アイテム変換結果」シート関連
@@ -2059,6 +2188,60 @@ function fetchJdsAnnouncementSourceResult_() {
   );
 }
 
+// ---- 厚労省報道発表（薬機法等の法的関連情報）：ネットワーク取得（GAS依存） ----
+
+var MHLW_HOUDOU_LIST_BASE_URL = 'https://www.mhlw.go.jp/stf/houdou/houdou_list_';
+
+/**
+ * 厚労省「報道発表資料」月別一覧を取得し、{ sourceId, success, items, fetchedAt, error }
+ * の形で返す。当月のページを試し、取得できなければ前月のページにフォールバックする
+ * （月初めでまだ当月ページが作成されていない場合に備える）。
+ * このページは雇用・年金・介護・感染症等あらゆる分野の発表が混ざっているため、
+ * MHLW_LEGAL_KEYWORDS_による絞り込みが必須（buildMhlwHoudouIncomingItems_が行う）。
+ */
+function fetchMhlwHoudouSourceResult_() {
+  var startedAt = new Date().toISOString();
+  var candidates = mhlwHoudouYearMonthCandidates_(new Date());
+  var html = null;
+  var lastError = null;
+
+  for (var i = 0; i < candidates.length; i++) {
+    var url = MHLW_HOUDOU_LIST_BASE_URL + candidates[i] + '.html';
+    try {
+      var response = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true });
+      var code = response.getResponseCode();
+      if (code === 200) {
+        html = response.getContentText('UTF-8');
+        break;
+      }
+      lastError = url + ' の取得に失敗しました（HTTP ' + code + '）';
+    } catch (e) {
+      lastError = url + ' の取得中にエラー: ' + e;
+    }
+  }
+
+  if (html === null) {
+    return {
+      sourceId: 'mhlw_houdou',
+      success: false,
+      items: [],
+      fetchedAt: new Date().toISOString(),
+      startedAt: startedAt,
+      error: lastError || '厚労省報道発表一覧の取得に失敗しました（当月・前月とも）',
+    };
+  }
+
+  var entries = extractDatedAnnouncementEntries_(html, buildMhlwHoudouLinkRegex_());
+  if (entries.length === 0) {
+    Logger.log('厚労省報道発表一覧からリンクを1件も抽出できませんでした。ページ構成が変わった可能性があります。');
+  }
+
+  var fetchedAtIso = new Date().toISOString();
+  var items = buildMhlwHoudouIncomingItems_(entries, fetchedAtIso);
+
+  return { sourceId: 'mhlw_houdou', success: true, items: items, fetchedAt: fetchedAtIso, startedAt: startedAt, error: null };
+}
+
 // ---- 実行エントリーポイント ----
 
 /**
@@ -2084,6 +2267,7 @@ function runConvertAllToInformationItems() {
   var mindsResult = fetchMindsGuidelineSourceResult_();
   var naikaResult = fetchNaikaAnnouncementSourceResult_();
   var jdsResult = fetchJdsAnnouncementSourceResult_();
+  var mhlwHoudouResult = fetchMhlwHoudouSourceResult_();
 
   var lock = LockService.getScriptLock();
   var gotLock = false;
@@ -2105,7 +2289,7 @@ function runConvertAllToInformationItems() {
     var nowIso = new Date().toISOString();
     var applied = applyFetchResultsToState_(
       existingById,
-      pmdaResults.concat([mhlwResult, mindsResult, naikaResult, jdsResult]),
+      pmdaResults.concat([mhlwResult, mindsResult, naikaResult, jdsResult, mhlwHoudouResult]),
       nowIso,
     );
 
@@ -2127,7 +2311,9 @@ function runConvertAllToInformationItems() {
         ' / 日本内科学会: ' +
         (naikaResult.success ? '成功(' + naikaResult.items.length + '件)' : '失敗: ' + naikaResult.error) +
         ' / 日本糖尿病学会: ' +
-        (jdsResult.success ? '成功(' + jdsResult.items.length + '件)' : '失敗: ' + jdsResult.error),
+        (jdsResult.success ? '成功(' + jdsResult.items.length + '件)' : '失敗: ' + jdsResult.error) +
+        ' / 厚労省報道発表: ' +
+        (mhlwHoudouResult.success ? '成功(' + mhlwHoudouResult.items.length + '件)' : '失敗: ' + mhlwHoudouResult.error),
     );
   } finally {
     lock.releaseLock();
@@ -2252,6 +2438,13 @@ function runConvertNaikaAnnouncementToInformationItems() {
 function runConvertJdsAnnouncementToInformationItems() {
   runSingleSourceConversion_(function () {
     return [fetchJdsAnnouncementSourceResult_()];
+  });
+}
+
+/** 厚労省報道発表（薬機法等）だけを取得してマージする（動作確認用の単体実行）。 */
+function runConvertMhlwHoudouToInformationItems() {
+  runSingleSourceConversion_(function () {
+    return [fetchMhlwHoudouSourceResult_()];
   });
 }
 

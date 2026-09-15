@@ -1,4 +1,4 @@
-# GAS実装（v3.4）
+# GAS実装（v3.5）
 
 `pmda-recall-fetcher.gs` 1ファイルに、データ取得・変更検知・Web App化・定期実行のすべてが入っている（フリちゃんが「ファイルを丸ごと貼り替える」運用のため、あえて単一ファイル構成にしている）。
 
@@ -47,7 +47,7 @@ Googleスプレッドシート内に3つのシートを持つ。
 | --- | --- |
 | `information_items` | 現在の状態（1id=1行）。人間の確認状態・重要度・HOME表示・変更検知用のハッシュ・欠落回数を含む |
 | `information_item_history` | 内容変更・供給再開・掲載未確認を検知するたびに追記される変更履歴 |
-| `source_run_logs` | 情報源（PMDA／厚労省／Minds／学会お知らせ）ごとの実行結果（成功/失敗・件数・エラー内容）のログ |
+| `source_run_logs` | 情報源（PMDA／厚労省供給／Minds／学会お知らせ／厚労省報道発表）ごとの実行結果（成功/失敗・件数・エラー内容）のログ |
 
 v2までの「情報アイテム変換結果」シートは削除しない。初回実行時に自動移行され、「旧_情報アイテム変換結果」という名前でそのまま残る（詳細は後述）。
 
@@ -135,6 +135,7 @@ PMDA CSV・厚労省Excelから取得した文字列のうち、先頭が `=` `+
 - `runConvertMindsGuidelineToInformationItems`：Mindsガイドラインお知らせだけ取得してマージ
 - `runConvertNaikaAnnouncementToInformationItems`：日本内科学会お知らせだけ取得してマージ
 - `runConvertJdsAnnouncementToInformationItems`：日本糖尿病学会お知らせだけ取得してマージ
+- `runConvertMhlwHoudouToInformationItems`：厚労省報道発表（薬機法等）だけ取得してマージ
 - `runPmdaRecallCsvPoc`：`information_items` の仕組みとは独立した、PMDA CSVの生データ確認用（`PMDA_回収情報_PoC`シート）
 - `listTriggers` / `setupDailyTrigger` / `removeDailyTrigger`：定期実行トリガーの確認・設定・削除
 
@@ -187,6 +188,25 @@ Mindsガイドラインライブラリ（公益財団法人日本医療機能評
 - HTML解析はGAS API非依存の純粋関数（`findJapaneseDateAsIso_` / `isTreatmentRelatedAnnouncementTitle_` / `extractDatedAnnouncementEntries_` / `buildNaikaAnnouncementLinkRegex_` / `buildJdsAnnouncementLinkRegex_` / `buildGakkaiAnnouncementItem_` / `buildGakkaiIncomingItems_`）として実装し、`test/gas-pure-logic.test.mjs`でテストしている
 - 一覧ページの実際のHTML構造は未確認のまま実装している。href（`/info/{slug}/`・`?content_id={数字}`）というURLパターンと、リンク直前の日付テキストだけを頼りに抽出するようにして構造変化に強くしてあるが、**初回実行後は`information_items`シートに実際にそれらしい「治療情報」アイテムが正しく登録されているか、フリちゃんの環境で必ず確認してほしい**（0件のままなら`source_run_logs`のエラー内容を確認）
 - キーワードによる絞り込み（`GAKKAI_TREATMENT_KEYWORDS_`）は初回実装時点の暫定案。実際の取得結果を見ながら調整していく想定
+
+### 厚労省報道発表（薬機法等の法的関連情報、v3.5で追加）
+
+- 厚生労働省「報道発表資料」の月別一覧ページ（`https://www.mhlw.go.jp/stf/houdou/houdou_list_{YYYYMM}.html`）をHTML取得・パースする。URLが月ごとに変わるため、日付から当月・前月のYYYYMMを自動算出する（`mhlwHoudouYearMonthCandidates_`。月初めでまだ当月ページが作成されていない場合に備えて前月にもフォールバックする、PMDAの年度計算と同じ考え方）。
+- このページは雇用・年金・介護・感染症等、厚労省のあらゆる分野の発表が混ざっている一覧のため、他のお知らせ系ボットよりも強めの絞り込みが必要。タイトルに **「薬機法」「医薬品」「医療機器」「薬事」「調剤」「薬局」「処方箋」「医薬部外品」「再生医療等製品」「省令」「告示」** のいずれかを含むものだけを対象にする（`MHLW_LEGAL_KEYWORDS_`で定義。フリちゃんと合意済み）。
+- 学会お知らせと同じ理由（日付とタイトルへのリンクが別要素）で、`extractDatedAnnouncementEntries_`（汎用パース関数）をそのまま再利用している。詳細ページへのリンクは`/stf/newpage_{数字}.html`という現行の主要パターンのみを対象にしており、これに当てはまらない古い形式のリンク（`/stf/houdou/...`等）は拾えない場合がある。
+- カテゴリは`pharmacy`、itemTypeは`行政通知`に固定。重要度は一律`info`（参考）からスタートし、人間が個別に確認・重要度確定する運用。
+- キーワードセット・リンクパターンともに初回実装時点の暫定案。実際に取れた件数・中身（雇用や介護のニュースが誤って混入していないか等）を見ながら調整していく想定。
+
+## v3.4→v3.5の変更点（薬機法等の法的関連情報ボットの追加）
+
+厚生労働省「報道発表資料」月別一覧を新しい情報源（`mhlw_houdou`）として追加した。詳細は上の「取得している情報」内の該当節を参照。
+
+- 「薬機法等の法的な最新情報を拾いたい」という要望から。厚労省・日本薬剤師会双方の公式な法令・通知情報はほぼ月次PDF公報の形でしか公開されておらず機械的な解析が難しかったため、雇用・年金等も含む広範な「報道発表資料」一覧をキーワードで絞り込む方式を採用した（フリちゃんと合意済み）
+- 他の情報源と同様、独立したsourceId・`source_run_logs`エントリを持つため、この情報源の取得失敗・ページ構成変更が他情報源に影響することはない
+- `runConvertAllToInformationItems`（毎朝の自動実行）が6情報源（PMDA・厚労省供給・Minds・日本内科学会・日本糖尿病学会・厚労省報道発表）すべてを取得するようになった
+- 単体デバッグ実行用に`runConvertMhlwHoudouToInformationItems`を追加した
+- 新規の純粋関数：`formatYearMonth_` / `mhlwHoudouYearMonthCandidates_` / `isLegalRelatedAnnouncementTitle_` / `buildMhlwHoudouLinkRegex_` / `buildMhlwHoudouItem_` / `buildMhlwHoudouIncomingItems_`（`test/gas-pure-logic.test.mjs`でテスト済み）。日付・タイトルの抽出自体は学会お知らせと共通の`extractDatedAnnouncementEntries_`を再利用している
+- **他のボットよりノイズが多くなりやすい情報源**：報道発表資料はあらゆる分野が混在するため、キーワードに引っかかって誤って混入する無関係な発表が出てくる可能性がある。初回実行後は`information_items`シートの`sourceId`が`mhlw_houdou`の行を一通り見て、明らかに無関係なものが多ければ`MHLW_LEGAL_KEYWORDS_`を調整してほしい
 
 ## 次のステップ
 

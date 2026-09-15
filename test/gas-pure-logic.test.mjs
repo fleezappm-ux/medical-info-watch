@@ -937,3 +937,99 @@ describe('linkLabelForItemType_（治療情報追加分）', () => {
     expect(gas.linkLabelForItemType_('治療情報')).toBe('学会お知らせページ（原文）')
   })
 })
+
+describe('formatYearMonth_', () => {
+  it('1桁月を0埋めしてYYYYMM形式にする', () => {
+    expect(gas.formatYearMonth_(2026, 9)).toBe('202609')
+    expect(gas.formatYearMonth_(2026, 1)).toBe('202601')
+  })
+
+  it('2桁月はそのまま', () => {
+    expect(gas.formatYearMonth_(2026, 12)).toBe('202612')
+  })
+})
+
+describe('mhlwHoudouYearMonthCandidates_', () => {
+  it('当月→前月の順で2件返す', () => {
+    const candidates = gas.mhlwHoudouYearMonthCandidates_(new Date('2026-09-14T12:00:00+09:00'))
+    expect(candidates).toEqual(['202609', '202608'])
+  })
+
+  it('1月の場合、前月は前年12月になる', () => {
+    const candidates = gas.mhlwHoudouYearMonthCandidates_(new Date('2026-01-05T12:00:00+09:00'))
+    expect(candidates).toEqual(['202601', '202512'])
+  })
+})
+
+describe('isLegalRelatedAnnouncementTitle_', () => {
+  it('合意済みキーワードのいずれかを含めばtrue', () => {
+    expect(gas.isLegalRelatedAnnouncementTitle_('医薬品、医療機器等の品質、有効性及び安全性の確保等に関する法律施行規則の一部改正について')).toBe(true)
+    expect(gas.isLegalRelatedAnnouncementTitle_('薬局における調剤業務のあり方について')).toBe(true)
+    expect(gas.isLegalRelatedAnnouncementTitle_('医薬品医療機器等法に基づく行政処分を行いました')).toBe(true)
+  })
+
+  it('薬事と関係ない発表はfalse', () => {
+    expect(gas.isLegalRelatedAnnouncementTitle_('一般職業紹介状況(令和4年6月分)について')).toBe(false)
+    expect(gas.isLegalRelatedAnnouncementTitle_('新型コロナウイルス感染症の患者等の発生について(検疫)')).toBe(false)
+  })
+
+  it('文字列以外はfalse', () => {
+    expect(gas.isLegalRelatedAnnouncementTitle_(null)).toBe(false)
+    expect(gas.isLegalRelatedAnnouncementTitle_(undefined)).toBe(false)
+  })
+})
+
+describe('extractDatedAnnouncementEntries_ / buildMhlwHoudouLinkRegex_', () => {
+  const mhlwSampleHtml = `
+    <h3>2026年9月14日(月)掲載</h3>
+    <ul>
+      <li><a href="https://www.mhlw.go.jp/stf/newpage_65724.html">医薬品医療機器等法に基づく行政処分を行いました</a></li>
+      <li><a href="https://www.mhlw.go.jp/stf/newpage_43964.html">産業競争力強化法に基づく「事業再編計画」の認定について</a></li>
+    </ul>
+    <h3>2026年9月13日(日)掲載</h3>
+    <ul>
+      <li><a href="https://www.mhlw.go.jp/stf/newpage_63961.html">一般職業紹介状況(令和8年8月分)について</a></li>
+    </ul>
+  `
+
+  it('日付・タイトル・URLを対応付けて抽出する', () => {
+    const entries = gas.extractDatedAnnouncementEntries_(mhlwSampleHtml, gas.buildMhlwHoudouLinkRegex_())
+    expect(entries).toHaveLength(3)
+    expect(entries[0]).toEqual({
+      id: '65724',
+      url: 'https://www.mhlw.go.jp/stf/newpage_65724.html',
+      title: '医薬品医療機器等法に基づく行政処分を行いました',
+      publishedAt: '2026-09-14',
+    })
+    expect(entries[2].publishedAt).toBe('2026-09-13')
+  })
+})
+
+describe('buildMhlwHoudouIncomingItems_ / buildMhlwHoudouItem_', () => {
+  const entries = [
+    { id: '65724', url: 'https://www.mhlw.go.jp/stf/newpage_65724.html', title: '医薬品医療機器等法に基づく行政処分を行いました', publishedAt: '2026-09-14' },
+    { id: '43964', url: 'https://www.mhlw.go.jp/stf/newpage_43964.html', title: '産業競争力強化法に基づく「事業再編計画」の認定について', publishedAt: '2026-09-14' },
+  ]
+
+  it('キーワードを含むものだけをアイテムに変換する', () => {
+    const items = gas.buildMhlwHoudouIncomingItems_(entries, '2026-09-14T00:00:00.000Z')
+    expect(items).toHaveLength(1)
+    expect(items[0].id).toBe('mhlw_houdou_65724')
+  })
+
+  it('category=pharmacy、itemType=行政通知、重要度は一律info', () => {
+    const item = gas.buildMhlwHoudouItem_(entries[0], '2026-09-14T00:00:00.000Z')
+    expect(item.category).toBe('pharmacy')
+    expect(item.itemType).toBe('行政通知')
+    expect(item.aiImportance).toBe('info')
+    expect(item.sourceRecordId).toBe('65724')
+    expect(item.primaryUrl).toBe(entries[0].url)
+    expect(item.sourceName).toBe('厚生労働省（報道発表資料）')
+  })
+})
+
+describe('linkLabelForItemType_（行政通知追加分）', () => {
+  it("itemType '行政通知' は厚労省報道発表のラベルを返す", () => {
+    expect(gas.linkLabelForItemType_('行政通知')).toBe('厚労省 報道発表資料（原文）')
+  })
+})
