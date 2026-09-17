@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 import { Header } from './components/Header'
 import { TabNav, type ListTab } from './components/TabNav'
+import { ItemFilters } from './components/ItemFilters'
 import { ItemList } from './components/ItemList'
 import { ItemDetail } from './components/ItemDetail'
 import { WatchSettings } from './components/WatchSettings'
@@ -11,6 +12,7 @@ import { mockWatchSettings } from './data/mockWatchSettings'
 import type { ImportanceLevel, SourceStatus, WatchLevel } from './types'
 import { fetchInformationItemsFromApi, fetchHistoryForItem, postUpdateToApi } from './lib/api'
 import { canMarkReviewed, canConfirmImportance, canConfirmHomeDisplay, isConfirmedImportant, needsReview, hasContentChanged, hasFetchError } from './lib/review'
+import { filterByCategoryAndSource, uniqueSourceNames, countByCategory, type CategoryFilter, type SourceFilter } from './lib/filters'
 
 type View = 'list' | 'settings'
 
@@ -40,6 +42,8 @@ function App() {
   const [syncError, setSyncError] = useState<string | null>(null)
   const [view, setView] = useState<View>('list')
   const [tab, setTab] = useState<ListTab>('all')
+  const [categoryFilter, setCategoryFilter] = useState<CategoryFilter>('all')
+  const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all')
   const [selectedId, setSelectedId] = useState<string | null>(null)
 
   // 確認状態・ウォッチ設定の保存（POST）は、送った順番どおりにサーバーへ届くとは限らない
@@ -48,16 +52,33 @@ function App() {
   // まだ保存し切れていない古い状態を読み込んでしまうことがある。
   const syncQueueRef = useRef<Promise<void>>(Promise.resolve())
 
+  const categoryAndSourceFiltered = useMemo(
+    () => filterByCategoryAndSource(items, categoryFilter, sourceFilter),
+    [items, categoryFilter, sourceFilter],
+  )
+
   const counts = useMemo(
     () => ({
-      all: items.length,
-      unreviewed: items.filter(needsReview).length,
-      changed: items.filter(hasContentChanged).length,
-      important: items.filter(isConfirmedImportant).length,
-      error: items.filter(hasFetchError).length,
+      all: categoryAndSourceFiltered.length,
+      unreviewed: categoryAndSourceFiltered.filter(needsReview).length,
+      changed: categoryAndSourceFiltered.filter(hasContentChanged).length,
+      important: categoryAndSourceFiltered.filter(isConfirmedImportant).length,
+      error: categoryAndSourceFiltered.filter(hasFetchError).length,
     }),
-    [items],
+    [categoryAndSourceFiltered],
   )
+
+  // カテゴリチップの件数は情報源フィルタだけを適用した状態で数える
+  // （カテゴリ自身の絞り込みをかけてしまうと、選んでいないカテゴリの件数が常に0になってしまうため）。
+  const categoryCounts = useMemo(
+    () => countByCategory(filterByCategoryAndSource(items, 'all', sourceFilter)),
+    [items, sourceFilter],
+  )
+  const categoryTotalCount = useMemo(
+    () => filterByCategoryAndSource(items, 'all', sourceFilter).length,
+    [items, sourceFilter],
+  )
+  const sourceOptions = useMemo(() => uniqueSourceNames(items), [items])
 
   const selectedItem = items.find((i) => i.id === selectedId) ?? null
 
@@ -249,8 +270,22 @@ function App() {
         {view === 'list' && !selectedItem && (
           <>
             {isRealData && sourceStatuses.length > 0 && <SourceStatusPanel sourceStatuses={sourceStatuses} />}
+            <ItemFilters
+              category={categoryFilter}
+              onCategoryChange={setCategoryFilter}
+              categoryCounts={categoryCounts}
+              totalCount={categoryTotalCount}
+              source={sourceFilter}
+              onSourceChange={setSourceFilter}
+              sourceOptions={sourceOptions}
+            />
             <TabNav active={tab} onChange={setTab} counts={counts} />
-            <ItemList items={items} tab={tab} onSelect={setSelectedId} />
+            <ItemList
+              items={categoryAndSourceFiltered}
+              tab={tab}
+              onSelect={setSelectedId}
+              groupByCategory={categoryFilter === 'all'}
+            />
           </>
         )}
 

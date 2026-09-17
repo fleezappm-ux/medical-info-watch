@@ -2,11 +2,15 @@ import type { InformationItem } from '../types'
 import type { ListTab } from './TabNav'
 import { ItemRow } from './ItemRow'
 import { isConfirmedImportant, needsReview, hasContentChanged, hasFetchError } from '../lib/review'
+import { groupByCategory } from '../lib/filters'
+import { categoryLabel } from '../lib/importance'
 
 interface Props {
   items: InformationItem[]
   tab: ListTab
   onSelect: (id: string) => void
+  /** trueのとき、カテゴリ（項目）別に見出しを付けてグループ表示する（カテゴリ絞り込みが「すべて」のときのみ使う）。 */
+  groupByCategory?: boolean
 }
 
 function filterByTab(items: InformationItem[], tab: ListTab): InformationItem[] {
@@ -38,11 +42,32 @@ const emptyMessage: Record<ListTab, string> = {
   error: '取得・解析エラーはありません。',
 }
 
-export function ItemList({ items, tab, onSelect }: Props) {
+export function ItemList({ items, tab, onSelect, groupByCategory: shouldGroup = false }: Props) {
   const filtered = sortByRecency(filterByTab(items, tab))
 
   if (filtered.length === 0) {
     return <p className="empty-state">{emptyMessage[tab]}</p>
+  }
+
+  if (shouldGroup) {
+    const groups = groupByCategory(filtered)
+    return (
+      <div className="item-list-groups">
+        {groups.map((group) => (
+          <section key={group.category} className="item-list-group">
+            <h2 className="item-list-group-heading">
+              {categoryLabel[group.category]}
+              <span className="item-list-group-count">{group.items.length}件</span>
+            </h2>
+            <ul className="item-list">
+              {group.items.map((item) => (
+                <ItemRow key={item.id} item={item} onSelect={onSelect} />
+              ))}
+            </ul>
+          </section>
+        ))}
+      </div>
+    )
   }
 
   return (

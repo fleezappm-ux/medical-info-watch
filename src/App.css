@@ -208,6 +208,97 @@
   color: var(--brand);
 }
 
+/* --- カテゴリ（項目）・情報源フィルタ --- */
+.item-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.item-filters-categories {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.category-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line);
+  background: #fff;
+  border-radius: 999px;
+  padding: 5px 12px;
+  font-size: 13px;
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+
+.category-chip.is-selected {
+  border-color: var(--brand);
+  background: var(--brand-soft);
+  color: var(--brand);
+  font-weight: 700;
+}
+
+.category-chip-count {
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-faint);
+  font-size: 12px;
+}
+
+.category-chip.is-selected .category-chip-count {
+  color: var(--brand);
+}
+
+.item-filters-source {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+
+.item-filters-source select {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 5px 8px;
+  font-size: 13px;
+  color: var(--ink);
+  background: #fff;
+  max-width: 220px;
+}
+
+/* --- 項目（カテゴリ）別グループ表示 --- */
+.item-list-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+.item-list-group-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 0 10px;
+  padding-bottom: 6px;
+  border-bottom: 2px solid var(--line-strong);
+  font-family: var(--font-display);
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.item-list-group-count {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--ink-faint);
+}
+
 /* --- 情報源ごとの取得状況 --- */
 .source-status-panel {
   display: flex;
