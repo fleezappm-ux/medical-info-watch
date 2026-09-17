@@ -57,6 +57,61 @@
   color: var(--signal-critical);
 }
 
+/* --- COLLECTAランチャーボタン（ブラウザで開く／デスクトップに追加） --- */
+.collecta-launch-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px 8px 8px;
+  border-radius: 999px;
+  background: var(--brand-soft);
+  border: 1px solid var(--line);
+  text-decoration: none;
+  color: var(--brand);
+  transition: background-color 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+}
+
+.collecta-launch-button:hover {
+  background: #d7e0ea;
+  border-color: var(--line-strong);
+  transform: translateY(-1px);
+}
+
+.collecta-launch-button:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+.collecta-launch-icon {
+  width: 32px;
+  height: 32px;
+  display: block;
+  flex-shrink: 0;
+}
+
+.collecta-launch-label {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.3;
+}
+
+.collecta-launch-label strong {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.collecta-launch-label small {
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+
+@media (max-width: 560px) {
+  .collecta-launch-label small {
+    display: none;
+  }
+}
+
 .mock-banner {
   margin: 16px 0 0;
   padding: 8px 14px;

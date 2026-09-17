@@ -1,0 +1,37 @@
+{
+  "name": "COLLECTA（医療情報ウォッチ）",
+  "short_name": "COLLECTA",
+  "description": "薬局・クリニック向けの規制・臨床情報を自動収集するCOLLECTAアプリ",
+  "start_url": "/medical-info-watch/",
+  "scope": "/medical-info-watch/",
+  "display": "standalone",
+  "background_color": "#eef0ee",
+  "theme_color": "#08204a",
+  "lang": "ja",
+  "icons": [
+    {
+      "src": "/medical-info-watch/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/medical-info-watch/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/medical-info-watch/icons/icon-192-maskable.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/medical-info-watch/icons/icon-512-maskable.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

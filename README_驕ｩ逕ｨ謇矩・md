@@ -1,0 +1,42 @@
+medical-info-watch フロント修正一式（COLLECTAボタン + アイコン追加）
+====================================================
+
+## やること
+
+このzipの中身を、GitHub Desktopで開いているmedical-info-watchのフォルダに
+そのまま上書きコピーしてください（フォルダ構成は同じにしてあります）。
+
+上書き対象：
+  - index.html                          ← 上書き
+  - src/App.css                          ← 上書き
+  - src/components/Header.tsx            ← 上書き
+  - public/favicon.ico                   ← 新規追加
+  - public/manifest.webmanifest          ← 新規追加
+  - public/icons/ フォルダ一式（12ファイル） ← 新規追加
+
+コピーし終わったら、いつも通り GitHub Desktop でコミット・push すればOKです
+（`main`へのpushで自動的にビルド・デプロイされます）。
+
+## 動作確認済み
+
+  - npm run build が通ること
+  - 既存テスト106件が全部通ること（npm test）
+  - ビルド後のindex.html・JSが正しく /medical-info-watch/ 配下のアイコンを
+    参照していること
+
+## 変更内容
+
+  - ヘッダー（画面上部、施設名の右側）に「COLLECTA」ボタンを追加。
+    クリックすると、このアプリの本当の公開URL
+    （https://fleezappm-ux.github.io/medical-info-watch/）を新しいタブで開く。
+    Pharmacy OS（Notion）等に埋め込んで見ている場合、埋め込み枠の中では
+    ブラウザの「ホーム画面に追加」が使えないため、まずこのボタンで
+    本物のブラウザタブとして開き直せるようにしている。
+  - 添付いただいたCOLLECTAロゴから、チェッカーボード（透過表示用の市松模様）を
+    取り除いて本物の透過PNGを作成し、favicon・アプリアイコン各種
+    （favicon.ico、16/32px favicon、180px apple-touch-icon、
+    192/512pxの通常アイコン・maskableアイコン）を書き出した。
+  - manifest.webmanifest を追加し、名前を「COLLECTA」としてPWA化
+    （対応ブラウザでは「ホーム画面に追加」「アプリをインストール」から
+    ホーム画面にCOLLECTAのアイコンで追加できる）。
+  - index.htmlにfavicon・apple-touch-icon・manifestへのリンクを追加。
