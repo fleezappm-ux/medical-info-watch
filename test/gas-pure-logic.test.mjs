@@ -979,7 +979,7 @@ describe('isLegalRelatedAnnouncementTitle_', () => {
   })
 })
 
-describe('extractDatedAnnouncementEntries_ / buildMhlwHoudouLinkRegex_', () => {
+describe('extractMhlwHoudouEntries_', () => {
   const mhlwSampleHtml = `
     <h3>2026年9月14日(月)掲載</h3>
     <ul>
@@ -992,16 +992,36 @@ describe('extractDatedAnnouncementEntries_ / buildMhlwHoudouLinkRegex_', () => {
     </ul>
   `
 
-  it('日付・タイトル・URLを対応付けて抽出する', () => {
-    const entries = gas.extractDatedAnnouncementEntries_(mhlwSampleHtml, gas.buildMhlwHoudouLinkRegex_())
+  // v3.5では固定パターンのbuildMhlwHoudouLinkRegex_ + extractDatedAnnouncementEntries_だったが、
+  // URLパターンが混在していて大半を拾い落とす不具合があったため、v3.5→v3.6でextractMhlwHoudouEntries_
+  // （/stf/・/toukei/配下を広く拾い、直前3000文字以内に日付があるものだけ採用）に置き換えられた。
+  // idは「回収番号」のような単純な数字ではなく、パス自体を'_'区切りにしたもの
+  // （例：/stf/newpage_65724.html → stf_newpage_65724）になっている点に注意。
+  it('日付・タイトル・URLを対応付けて抽出する（idはパスベース）', () => {
+    const entries = gas.extractMhlwHoudouEntries_(mhlwSampleHtml)
     expect(entries).toHaveLength(3)
     expect(entries[0]).toEqual({
-      id: '65724',
+      id: 'stf_newpage_65724',
       url: 'https://www.mhlw.go.jp/stf/newpage_65724.html',
       title: '医薬品医療機器等法に基づく行政処分を行いました',
       publishedAt: '2026-09-14',
     })
     expect(entries[2].publishedAt).toBe('2026-09-13')
+  })
+
+  it('直前に日付が無いリンク（メニュー等）は除外する', () => {
+    const html = '<a href="https://www.mhlw.go.jp/stf/menu.html">メニュー</a>'
+    expect(gas.extractMhlwHoudouEntries_(html)).toHaveLength(0)
+  })
+
+  it('/toukei/配下のリンクも対象にする', () => {
+    const html = `
+      <h3>2026年9月14日(月)掲載</h3>
+      <a href="/toukei/list/20-21.html">毎月勤労統計調査</a>
+    `
+    const entries = gas.extractMhlwHoudouEntries_(html)
+    expect(entries).toHaveLength(1)
+    expect(entries[0].url).toBe('https://www.mhlw.go.jp/toukei/list/20-21.html')
   })
 })
 
@@ -1031,5 +1051,126 @@ describe('buildMhlwHoudouIncomingItems_ / buildMhlwHoudouItem_', () => {
 describe('linkLabelForItemType_（行政通知追加分）', () => {
   it("itemType '行政通知' は厚労省報道発表のラベルを返す", () => {
     expect(gas.linkLabelForItemType_('行政通知')).toBe('厚労省 報道発表資料（原文）')
+  })
+})
+
+// ---- 沢井製薬お知らせ（v3.6で追加、ZIPが未追従だった部分） ----
+
+describe('parseSawaiAnnouncementText_', () => {
+  it('供給関連：日付・カテゴリ・タイトルを分離し、PDFNEW等の装飾語を除去する', () => {
+    const parsed = gas.parseSawaiAnnouncementText_(
+      '2026/09/14供給関連PDFNEW アレンドロン酸錠35mg「サワイ」の供給に関するお詫びとお願いPDFNEW',
+    )
+    expect(parsed).toEqual({
+      publishedAt: '2026-09-14',
+      category: '供給関連',
+      title: 'アレンドロン酸錠35mg「サワイ」の供給に関するお詫びとお願い',
+    })
+  })
+
+  it('回収情報セクション（カテゴリラベル無し）はcategoryが空文字になる', () => {
+    const parsed = gas.parseSawaiAnnouncementText_('2026/09/10 ベタメタゾン錠0.5mg「サワイ」自主回収（クラスII）に関するお知らせ')
+    expect(parsed.category).toBe('')
+    expect(parsed.title).toContain('自主回収')
+  })
+})
+
+describe('isSawaiSupplyOrRecallAnnouncement_', () => {
+  it('カテゴリが供給関連ならtrue', () => {
+    expect(gas.isSawaiSupplyOrRecallAnnouncement_({ category: '供給関連', title: 'x' })).toBe(true)
+  })
+
+  it('カテゴリが空でタイトルに回収を含むならtrue（回収情報セクション）', () => {
+    expect(gas.isSawaiSupplyOrRecallAnnouncement_({ category: '', title: '自主回収のお知らせ' })).toBe(true)
+  })
+
+  it('それ以外のカテゴリ（安全性・適正使用関連等）はfalse', () => {
+    expect(gas.isSawaiSupplyOrRecallAnnouncement_({ category: '安全性・適正使用関連', title: 'x' })).toBe(false)
+  })
+})
+
+describe('extractSawaiAnnouncementEntries_ / buildSawaiAnnouncementItem_ / buildSawaiIncomingItems_', () => {
+  const html =
+    '<a href="/file/announce/2026091401.pdf">2026/09/14供給関連 アレンドロン酸錠35mg「サワイ」の供給に関するお詫びとお願いPDF</a>' +
+    '<a href="/file/recall/2026091001.pdf">2026/09/10 ベタメタゾン錠0.5mg「サワイ」自主回収（クラスII）に関するお知らせPDF</a>' +
+    '<a href="/product/foo.html">製品情報メニュー</a>'
+
+  it('/file/配下のリンクだけを対象にし、パスの/を_に置き換えたidにする', () => {
+    const entries = gas.extractSawaiAnnouncementEntries_(html)
+    expect(entries).toHaveLength(2)
+    expect(entries[0].id).toBe('file_announce_2026091401')
+    expect(entries[1].category).toBe('')
+  })
+
+  it('供給関連はitemType「供給」、回収情報セクションはitemType「回収」になる', () => {
+    const entries = gas.extractSawaiAnnouncementEntries_(html)
+    const supplyItem = gas.buildSawaiAnnouncementItem_(entries[0], '2026-09-14T00:00:00.000Z')
+    const recallItem = gas.buildSawaiAnnouncementItem_(entries[1], '2026-09-14T00:00:00.000Z')
+    expect(supplyItem.itemType).toBe('供給')
+    expect(supplyItem.sourceName).toBe('沢井製薬（供給関連）')
+    expect(recallItem.itemType).toBe('回収')
+    expect(recallItem.sourceName).toBe('沢井製薬（回収情報）')
+  })
+
+  it('供給関連・回収情報以外（安全性・適正使用関連等）はincoming変換時に除外される', () => {
+    const htmlWithOther =
+      html + '<a href="/file/other/2026090801.pdf">2026/09/08安全性・適正使用関連 添付文書改訂のお知らせPDF</a>'
+    const entries = gas.extractSawaiAnnouncementEntries_(htmlWithOther)
+    const items = gas.buildSawaiIncomingItems_(entries, '2026-09-14T00:00:00.000Z')
+    expect(items).toHaveLength(2)
+  })
+})
+
+// ---- 日医工お知らせ（v3.7で追加、ZIPが未追従だった部分） ----
+
+describe('isNichiikoSupplyOrRecallTitle_', () => {
+  it('合意済みキーワードを含めばtrue', () => {
+    expect(gas.isNichiikoSupplyOrRecallTitle_('アトルバスタチン錠10mg「日医工」限定出荷のお知らせ')).toBe(true)
+    expect(gas.isNichiikoSupplyOrRecallTitle_('○○錠 自主回収のお知らせ')).toBe(true)
+  })
+
+  it('新発売・添文改訂等の対象外お知らせはfalse', () => {
+    expect(gas.isNichiikoSupplyOrRecallTitle_('新発売のお知らせ')).toBe(false)
+    expect(gas.isNichiikoSupplyOrRecallTitle_('使用上の注意改訂のお知らせ')).toBe(false)
+  })
+})
+
+describe('nichiikoWhatsNewYearCandidates_', () => {
+  it('当年→前年の順で2件返す（日本時間基準）', () => {
+    expect(gas.nichiikoWhatsNewYearCandidates_(new Date('2026-01-05T12:00:00+09:00'))).toEqual(['2026', '2025'])
+    expect(gas.nichiikoWhatsNewYearCandidates_(new Date('2026-09-14T12:00:00+09:00'))).toEqual(['2026', '2025'])
+  })
+})
+
+describe('extractDatedAnnouncementEntries_ / buildNichiikoAnnouncementLinkRegex_ / buildNichiikoAnnouncementItem_', () => {
+  // 日付は個別記事へのリンクの外側（同じ行の別セル等）にある想定。学会お知らせ・厚労省報道発表と
+  // 同じ汎用抽出関数（extractDatedAnnouncementEntries_）を使い回しているため、idはURLパスそのもの
+  // （'/'を含む）になる点に注意（沢井製薬側の専用抽出関数のようなid整形はされていない）。
+  const html =
+    '<tr><td>2026/9/12</td><td><a href="/medicine/files/2026/09/notice001.pdf">アトルバスタチン錠10mg「日医工」自主回収のお知らせ</a></td></tr>' +
+    '<a href="/medicine/expiration/index.php">使用期限一覧メニュー</a>'
+
+  it('/medicine/files/配下のリンクだけを対象にする', () => {
+    const entries = gas.extractDatedAnnouncementEntries_(html, gas.buildNichiikoAnnouncementLinkRegex_())
+    expect(entries).toHaveLength(1)
+    expect(entries[0].publishedAt).toBe('2026-09-12')
+  })
+
+  it('タイトルに「回収」を含むものはitemType「回収」、それ以外は「供給」になる', () => {
+    const entries = gas.extractDatedAnnouncementEntries_(html, gas.buildNichiikoAnnouncementLinkRegex_())
+    const item = gas.buildNichiikoAnnouncementItem_(entries[0], '2026-09-14T00:00:00.000Z')
+    expect(item.itemType).toBe('回収')
+    expect(item.sourceName).toBe('日医工（お知らせ）')
+
+    const supplyEntry = { ...entries[0], id: 'x2', title: '限定出荷のお知らせ' }
+    const supplyItem = gas.buildNichiikoAnnouncementItem_(supplyEntry, '2026-09-14T00:00:00.000Z')
+    expect(supplyItem.itemType).toBe('供給')
+  })
+})
+
+describe('linkLabelForItemType_（沢井製薬・日医工追加分）', () => {
+  it('sourceIdが沢井製薬・日医工の場合はそれぞれ専用ラベルを返す', () => {
+    expect(gas.linkLabelForItemType_('供給', 'sawai_announcement')).toBe('沢井製薬 お知らせ（原文）')
+    expect(gas.linkLabelForItemType_('回収', 'nichiiko_announcement')).toBe('日医工 お知らせ（原文）')
   })
 })

@@ -1,8 +1,14 @@
-# GAS実装（v3.5）
+# GAS実装（v3.7.5）
 
 `pmda-recall-fetcher.gs` 1ファイルに、データ取得・変更検知・Web App化・定期実行のすべてが入っている（フリちゃんが「ファイルを丸ごと貼り替える」運用のため、あえて単一ファイル構成にしている）。
 
-v3からの変更点（2次監査対応）は本ファイル末尾の「v3→v3.1の変更点」を、v3.1以降の変更点はさらにその下の各節を参照。
+v3からの変更点（2次監査対応）は本ファイル末尾の「v3→v3.1の変更点」を、v3.1以降の変更点はさらにその下の各節を参照。**v3.7.5時点の最新の状態を知りたい場合は、まず「v3.7.5時点のサマリー」を読むこと。**
+
+## v3.7.5時点のサマリー
+
+- 稼働中の情報源は8つ中7つ：`pmda_recall_class1/2/3`・`mhlw_supply`・`minds_guideline`・`naika_announcement`・`mhlw_houdou`・`sawai_announcement`・`nichiiko_announcement`
+- **`jds_announcement`（日本糖尿病学会）は一旦保留中。** JDS側のお知らせモジュール（`/modules/important/`・`/modules/important_list/`）だけが、ヘッダー・Cookieの内容に関係なくGASからのアクセスを一律HTTP 400で拒否するようになったため（サイト全体のブロックではない。詳細は「v3.7.1→v3.7.5の変更点」を参照）。取得ロジック自体は削除していないので、原因が分かれば`runConvertAllToInformationItems`内のコメントアウトを外すだけで再開できる
+- チャッピーの監査（v3.7.5時点）で、このgas/README.mdとZIP側のコードが実運用（v3.5相当のまま）から取り残されていた点を指摘された。本更新でその同期を行っている
 
 ## 取得している情報
 
@@ -38,6 +44,40 @@ v3からの変更点（2次監査対応）は本ファイル末尾の「v3→v3.
 - カテゴリは`clinical`（治療・臨床ウォッチ）、itemTypeは`治療情報`に固定。重要度は一律`info`（参考）からスタートし、Minds同様、自動判定基準が無いため人間が個別に確認・重要度確定する運用。
 - キーワードセットは初回実装時点の暫定案。実際に取れた件数・中身を見ながら追加・削除して調整していく想定（`GAKKAI_TREATMENT_KEYWORDS_`を編集するだけでよい）。
 - 一覧ページのHTML構造に依存したパースのため、各学会側でページのマークアップが大きく変わると抽出できなくなる可能性がある。その場合は`fetchNaikaAnnouncementSourceResult_`・`fetchJdsAnnouncementSourceResult_`が「取得0件」または失敗として`source_run_logs`に記録されるので、そこで気づける（他の情報源には影響しない）。
+- **日本糖尿病学会（`jds_announcement`）はv3.7.5より一旦保留中。** `runConvertAllToInformationItems`からは呼ばれていない（関数自体は残っている）。詳細は下の「v3.7.1→v3.7.5の変更点」を参照。
+
+### 沢井製薬お知らせ（v3.6で追加）
+
+- 沢井製薬の医療関係者向けサイト（`https://med.sawai.co.jp/`）トップページに掲載されるお知らせ一覧をHTML取得・パースする。会員登録・ログイン不要（確認済み）。東和薬品側は職種選択画面（Cookieベースの確認画面）が挟まり同じ方式では取得できなかったため、今回は沢井製薬のみ対応（他メーカーの調査結果は下の「個別メーカーサイト調査の全体像」を参照）。
+- お知らせ本文の先頭、日付の直後にカテゴリラベル（「供給関連」「安全性・適正使用関連」「電子添文改訂」「包装変更」「その他」）が付く形式。回収情報セクションのお知らせだけはこのラベルが付かない（`parseSawaiAnnouncementText_`がカテゴリ空文字として扱う）。
+- 対象は**「供給関連」カテゴリ**と、**回収情報セクション（カテゴリ空・タイトルに「回収」を含む）**だけ。「安全性・適正使用関連」「電子添文改訂」「包装変更」「その他」は対象外（フリちゃんと合意済み、`isSawaiSupplyOrRecallAnnouncement_`）。
+- itemTypeは回収情報セクション由来なら`回収`、それ以外（供給関連）なら`供給`（PMDA・厚労省供給と同じitemTypeを再利用）。カテゴリは`pharmacy`、重要度は一律`info`（参考）からスタートし、人間が個別に確認・重要度確定する運用。
+- 個別のお知らせPDFが置かれる`/file/`配下のリンクだけを対象にし、パスを`_`区切りにしたものをidにする（`extractSawaiAnnouncementEntries_`）。ナビゲーションメニュー等の大量のリンクを誤って拾わないための絞り込み。
+
+### 日医工お知らせ（v3.7で追加）
+
+- 日医工の医療関係者向けサイト（`https://www.nichiiko.co.jp/medicine/whatsnew/{年}/index.php`）の年別お知らせ一覧をHTML取得・パースする。会員登録・ログイン不要（確認済み。ページ下部に「あなたは医療関係者の方ですか？」という確認画面があるが表示上のものでコンテンツ自体は取得できる）。
+- URLが年ごとに変わるため、日付から当年・前年のURLを自動算出する（`nichiikoWhatsNewYearCandidates_`。厚労省報道発表の月計算と同じ考え方。年が変わった直後でまだ当年ページが無い場合に備えて前年にもフォールバックする）。
+- このページは新発売・使用上の注意改訂・休業案内等も含めたあらゆるお知らせが混ざった一覧のため、タイトルに **「限定出荷」「出荷停止」「出荷再開」「出荷調整」「自主回収」「供給状況」「供給停止」「供給再開」** のいずれかを含むものだけを対象にする（`NICHIIKO_WHATSNEW_KEYWORDS_`で定義。フリちゃんと合意済み）。
+- タイトルに「回収」を含むものはitemTypeを`回収`、それ以外は`供給`にする（PMDA・厚労省供給・沢井製薬と同じitemTypeを再利用）。
+- 日付とタイトルへのリンクが別要素になっているページのため、学会お知らせ・厚労省報道発表と共通の`extractDatedAnnouncementEntries_`を再利用している。**このためidはURLパス自体（`/`を含む）になっており、沢井製薬側のような`_`区切りへの整形はされていない**（`nichiiko_announcement_/medicine/files/...`のような見た目になる。動作上の問題は無いが、他の情報源とidの見た目を揃えるならここは直しどころとして残っている）。
+
+### 個別メーカーサイト調査の全体像（参考）
+
+「個別メーカーの供給情報・お詫び文書が欲しい」という要望を受けて調査した結果：
+
+| 情報源 | 結果 |
+| --- | --- |
+| 厚労省の新統一システム（`iyakuhin-kyokyu.mhlw.go.jp`） | ❌ ボット対策で明確にブロック |
+| DSJP（DrugShortage.jp） | ❌ 利用規約でスクレイピング・自動取得を明確に禁止 |
+| GE薬協の統一供給状況ページ | ❌ 2025年4月末で終了、厚労省Excelへの統合済み |
+| 沢井製薬（`med.sawai.co.jp`） | ✅ 実装済み（`sawai_announcement`） |
+| 日医工（`www.nichiiko.co.jp`） | ✅ 実装済み（`nichiiko_announcement`） |
+| 東和薬品（`med.towayakuhin.co.jp`） | ❌ 職種選択画面（Cookieベースのゲート）でブロック |
+| 第一三共エスファ（`med.daiichisankyo-ep.co.jp`） | ❓ ゲートは突破できたがお知らせ本文へのリンクがJavaScriptで動的読み込みの可能性、保留中 |
+| SCUEL（`scueldata.me/ph/`） | 参考ツールとして紹介のみ（ボット化はしていない） |
+
+
 
 ## データの構造
 
@@ -47,7 +87,7 @@ Googleスプレッドシート内に3つのシートを持つ。
 | --- | --- |
 | `information_items` | 現在の状態（1id=1行）。人間の確認状態・重要度・HOME表示・変更検知用のハッシュ・欠落回数を含む |
 | `information_item_history` | 内容変更・供給再開・掲載未確認を検知するたびに追記される変更履歴 |
-| `source_run_logs` | 情報源（PMDA／厚労省供給／Minds／学会お知らせ／厚労省報道発表）ごとの実行結果（成功/失敗・件数・エラー内容）のログ |
+| `source_run_logs` | 情報源（PMDA／厚労省供給／Minds／学会お知らせ／厚労省報道発表／沢井製薬／日医工。日本糖尿病学会は保留中のためv3.7.5以降は記録が増えない）ごとの実行結果（成功/失敗・件数・エラー内容）のログ |
 
 v2までの「情報アイテム変換結果」シートは削除しない。初回実行時に自動移行され、「旧_情報アイテム変換結果」という名前でそのまま残る（詳細は後述）。
 
@@ -208,7 +248,50 @@ Mindsガイドラインライブラリ（公益財団法人日本医療機能評
 - 新規の純粋関数：`formatYearMonth_` / `mhlwHoudouYearMonthCandidates_` / `isLegalRelatedAnnouncementTitle_` / `buildMhlwHoudouLinkRegex_` / `buildMhlwHoudouItem_` / `buildMhlwHoudouIncomingItems_`（`test/gas-pure-logic.test.mjs`でテスト済み）。日付・タイトルの抽出自体は学会お知らせと共通の`extractDatedAnnouncementEntries_`を再利用している
 - **他のボットよりノイズが多くなりやすい情報源**：報道発表資料はあらゆる分野が混在するため、キーワードに引っかかって誤って混入する無関係な発表が出てくる可能性がある。初回実行後は`information_items`シートの`sourceId`が`mhlw_houdou`の行を一通り見て、明らかに無関係なものが多ければ`MHLW_LEGAL_KEYWORDS_`を調整してほしい
 
-## 次のステップ
+## 次のステップ（チャッピーの監査（v3.7.5時点）を踏まえて更新）
 
-1. 医療機器等（区分`k`）への対象拡大
-2. 認証基盤の検討（本番運用前の必須課題）
+1. **（このコミットで対応）** ZIP（GitHub）側を実運用v3.7.5へ同期し、テスト・READMEを追従させる
+2. 情報一覧の使い勝手（「監視システムの管理画面」的なUIから、日々の業務で開きやすい画面への再設計）— フロント側の課題。詳細はリポジトリ本体の`README.md`・チャッピー監査メモを参照
+3. `information_items`全件を毎回一括取得している構成の見直し（期間・状態単位での分割取得、ページング）
+4. 医療機器等（区分`k`）への対象拡大
+5. 認証基盤の検討（本番運用前の必須課題）
+6. 日医工お知らせのid整形（`_`区切りへの統一。動作上の問題はないが他情報源とのidの見た目を揃えるならここ）
+7. 日本糖尿病学会（`jds_announcement`）の取得再開：原因（お知らせモジュールだけがGASからのアクセスを拒否）が解消されるか、別の回避策が見つかった場合
+
+## v3.5→v3.6の変更点（厚労省報道発表パーサーの修正、沢井製薬お知らせボットの追加）
+
+- **厚労省報道発表の抽出方式を修正**：v3.5の`buildMhlwHoudouLinkRegex_`（単一の固定URLパターンでの一致）では、実際のページのリンクURLパターンが`/stf/newpage_XXXXX.html`・`/stf/houdou/XXXXX_XXXXX.html`・`/toukei/...`等で混在しており、大半を拾い落としてしまう不具合があった（初回実装時に実際0件になった）。方針を変更し、`extractMhlwHoudouEntries_`という専用関数を新設：`/stf/`または`/toukei/`配下への`.html`リンク（絶対・相対どちらも許容）を広く対象にしつつ、**リンクの直前近く（3000文字以内）に日付がある場合だけ**を発表エントリとして採用するようにした。`buildMhlwHoudouLinkRegex_`は削除済み。
+  - idもURLパターンの混在に対応するため、リンクのパス自体（`/`を`_`に置き換えたもの、例：`stf_newpage_65724`）に変更した（旧・末尾の数字のみでは一意性を保証できないため）
+- 沢井製薬の医療関係者向けサイト（`med.sawai.co.jp`）お知らせ一覧を新しい情報源（`sawai_announcement`）として追加。詳細は上の「取得している情報」内の該当節を参照。
+- `runConvertAllToInformationItems`（毎朝の自動実行）が7情報源（PMDA・厚労省供給・Minds・日本内科学会・日本糖尿病学会・厚労省報道発表・沢井製薬）すべてを取得するようになった
+- 単体デバッグ実行用に`runConvertSawaiAnnouncementToInformationItems`を追加
+- 同じitemType（`回収`＝PMDAと沢井製薬、`供給`＝厚労省供給と沢井製薬）を複数の情報源が使うようになったため、`doGet`のリンクラベル決定（`linkLabelForItemType_`）にsourceIdも渡すよう拡張した
+- 新規の純粋関数：`parseSawaiAnnouncementText_` / `isSawaiSupplyOrRecallAnnouncement_` / `buildSawaiAnnouncementLinkRegex_` / `extractSawaiAnnouncementEntries_` / `sawaiAnnouncementHashFields_` / `buildSawaiAnnouncementItem_` / `buildSawaiIncomingItems_`（`test/gas-pure-logic.test.mjs`でテスト済み）
+
+## v3.6→v3.7の変更点（日医工お知らせボットの追加）
+
+日医工の医療関係者向けサイト（`www.nichiiko.co.jp`）の年別お知らせ一覧を新しい情報源（`nichiiko_announcement`）として追加した。詳細は上の「取得している情報」内の該当節を参照。
+
+- `runConvertAllToInformationItems`（毎朝の自動実行）が8情報源（PMDA・厚労省供給・Minds・日本内科学会・日本糖尿病学会・厚労省報道発表・沢井製薬・日医工）すべてを取得するようになった
+- 単体デバッグ実行用に`runConvertNichiikoAnnouncementToInformationItems`を追加
+- 新規の純粋関数：`isNichiikoSupplyOrRecallTitle_` / `buildNichiikoAnnouncementLinkRegex_` / `nichiikoAnnouncementHashFields_` / `buildNichiikoAnnouncementItem_` / `buildNichiikoIncomingItems_` / `nichiikoWhatsNewYearCandidates_`（`test/gas-pure-logic.test.mjs`でテスト済み）。日付・タイトルの抽出自体は学会お知らせ・厚労省報道発表と共通の`extractDatedAnnouncementEntries_`を再利用している
+
+## v3.7→v3.7.1の変更点（不具合修正の試み：日本糖尿病学会のHTTP 400対応）
+
+v3.7動作確認時、日本糖尿病学会（`jds_announcement`）だけが`runConvertAllToInformationItems`実行時にHTTP 400で失敗するようになった（v3.4実装時は成功していた）。「GASの`UrlFetchApp`はUser-Agentを送らないため、一部サイトに拒否される」という仮説のもと、学会お知らせ共通の取得関数（`fetchGakkaiAnnouncementSourceResult_`、日本内科学会・日本糖尿病学会で共用）にブラウザに近いUser-Agent・Accept-Languageヘッダーを追加した。
+
+**結果：直らなかった**（v3.7.2以降で原因を追った。下記参照）。
+
+## v3.7.1→v3.7.5の変更点（JDS HTTP 400の原因切り分け、および一旦保留の決定）
+
+v3.7.1のヘッダー追加でも直らなかったため、複数のGASチャットセッションにわたって原因を切り分けた。
+
+1. **ヘッダー5パターンの比較**（ヘッダーなし／User-Agentのみ／User-Agent+Accept-Language／ブラウザ相当のヘッダー一式／`followRedirects:false`）→ **全パターンで完全に同じHTTP 400**（本文もApacheの素の「Your browser sent a request that this server could not understand.」定型文で一致）。ヘッダーなし（v3.7より前の状態相当）でも400が出ており、v3.7.1のヘッダー追加が原因ではないと確定。
+2. **範囲の切り分け**：jds.or.jpのトップページ（`https://www.jds.or.jp/`）は正常にHTTP 200で取得できる一方、お知らせの個別記事ページ（`/modules/important/index.php?content_id=546`）は一覧ページと同じHTTP 400で拒否される。→ **サイト全体のブロックではなく、お知らせモジュール（`/modules/important/`・`/modules/important_list/`）だけを狙い撃ちにした制限**と判明。
+3. **Cookie必須化の仮説を検証**：トップページで正規に発行されたセッションCookie（`PHPSESSID=...`）を持たせてお知らせ一覧に再アクセス → **それでもHTTP 400**。Cookieの有無も無関係と確定。
+
+以上より、ヘッダー・Cookieのどちらをどう調整してもGAS側から回避する方法が見つからなかった（お知らせモジュールに対して、GAS＝Googleのサーバーの発信元自体が拒否されている可能性が高い）。フリちゃんと相談の上、**原因不明のまま一旦保留**とすることに決定。
+
+- `runConvertAllToInformationItems`（毎朝の自動実行）から日本糖尿病学会の取得を外した。他7情報源の取得・変更検知には一切影響しない
+- 取得ロジック本体（`fetchJdsAnnouncementSourceResult_`・`runConvertJdsAnnouncementToInformationItems`）は削除せず残してある。将来JDS側の制限が解除された・別の回避策が見つかった等の理由で再開する場合は、`runConvertAllToInformationItems`内のコメントアウトを外すだけでよい
+- 原因切り分け用に一時的に追加していた`runDebugJdsFetchVariants`（シートには一切書き込まないデバッグ専用関数）は、役目を終えたため削除した

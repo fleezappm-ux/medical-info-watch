@@ -1,6 +1,138 @@
 /**
- * 医療情報ウォッチ GAS本体（v3.5）
+ * 医療情報ウォッチ GAS本体（v3.7.5）
  * ------------------------------------------------------------
+ * v3.7.5の変更点（JDS取得の一旦保留）：
+ *   ・v3.7.2〜v3.7.4の切り分け（ヘッダー5パターン＋Cookie引き継ぎ＋範囲切り分け）の結果、
+ *     日本糖尿病学会のHTTP 400エラーは、ヘッダーの中身やCookieの有無とは無関係で、
+ *     お知らせモジュール（/modules/important/・/modules/important_list/）だけが
+ *     GAS（Googleのサーバー）からのアクセスを拒否していることが判明した
+ *     （サイトのトップページは正常に取得できる）。GAS側でリクエストの中身を
+ *     どういじっても再現よく回避する方法が見つからなかったため、フリちゃんと相談の上、
+ *     原因不明のまま一旦保留とすることにした。
+ *   ・runConvertAllToInformationItems（毎朝の自動実行）から日本糖尿病学会の取得を
+ *     外した。他7情報源の取得・変更検知には一切影響しない（設計上、情報源ごとに
+ *     独立しているため）。これにより、直しようがないエラーが毎朝ログに積み上がる
+ *     状態を止める。
+ *   ・取得ロジック本体（fetchJdsAnnouncementSourceResult_・
+ *     runConvertJdsAnnouncementToInformationItems等）は削除せず残してある。
+ *     将来、JDS側の制限が解除された・別の回避策が見つかった等の理由で再開する場合は、
+ *     runConvertAllToInformationItems内のコメントアウトを外すだけでよい。
+ *   ・原因切り分け用だったrunDebugJdsFetchVariants（v3.7.2〜v3.7.4で使用）は
+ *     役目を終えたため削除した。
+ *
+ * v3.7.4の変更点（JDS HTTP 400エラーの原因切り分け・続き）：
+ *   ・v3.7.3のF・Gパターンの結果、jds.or.jpのトップページ（F）は正常にHTTP 200で
+ *     取得できる一方、お知らせの個別記事ページ（G、/modules/important/index.php?
+ *     content_id=546）は一覧ページ（A〜E）と全く同じHTTP 400で拒否されることが
+ *     判明した。つまり、**サイト全体ではなく「お知らせモジュール
+ *     （/modules/important/・/modules/important_list/）だけ」が狙い撃ちで
+ *     ガードされている**。これは申し送りメモにあった「サーバー側がお知らせモジュールに
+ *     だけCookie必須化・bot対策強化を追加した可能性」を強く裏付ける結果。
+ *   ・そこで、よくあるパターン（トップページ等に1回アクセスして検証用Cookieを受け取り、
+ *     そのCookieを持っていないと保護対象のページには入れない、という2段階の保護）を
+ *     試すため、runDebugJdsFetchVariantsにHパターンを追加した：
+ *       H：まずトップページ（https://www.jds.or.jp/）にアクセスしてSet-Cookieヘッダーを
+ *          取得し、そのCookieを持たせた状態でお知らせ一覧ページに再アクセスする
+ *   ・Hが200になれば「Cookie必須化」が正解で、本番のfetchGakkaiAnnouncementSourceResult_
+ *     （日本糖尿病学会側のみ、日本内科学会は影響が無いので触らない）を2段階アクセスに
+ *     直せば直る。Hも400のままなら、Cookie以外の要因（IPレンジそのもののブロック等）が
+ *     濃厚になり、その場合はGAS側での対応は困難なため、申し送りメモにあった
+ *     「原因不明のまま一旦保留する」判断が妥当になる。
+ *
+ * v3.7.3の変更点（JDS HTTP 400エラーの原因切り分け・続き）：
+ *   ・v3.7.2のrunDebugJdsFetchVariants（A〜E、5パターンのヘッダー構成）を実行した結果、
+ *     **全パターンで完全に同じHTTP 400**が返ることが判明した（本文も一字一句同じ、
+ *     Apacheの素の「Your browser sent a request that this server could not
+ *     understand.」という定型文）。ヘッダーなし（v3.7より前の状態相当）でも400が
+ *     出ているため、v3.7.1で追加したUser-Agent等のヘッダーが原因ではないと確定した。
+ *   ・本文がAI判定やbot検知の警告ページではなくApacheの素の400定型文であることから、
+ *     アプリ（PHP）に届く前の、サーバー入口（Apache）レベルでリクエストそのものが
+ *     拒否されている可能性が高い。つまりヘッダーの中身の問題ではなく、
+ *     「GAS（Googleのサーバー）から来るリクエストという経路自体」が、この特定のURLに
+ *     対して拒否されていると考えられる。
+ *   ・追加の切り分けとして、runDebugJdsFetchVariants にF・Gの2パターンを追加した：
+ *       F：jds.or.jpのトップページ（https://www.jds.or.jp/）を取得できるか
+ *          → サイト全体がGASからのアクセスを拒否しているのか、それとも
+ *            important_listページだけに何か特別なガードがあるのかを切り分ける
+ *       G：お知らせ一覧に載っている個別記事ページ
+ *          （https://www.jds.or.jp/modules/important/index.php?content_id=546）を
+ *          取得できるか → 「一覧ページ（important_list）」と「個別記事ページ
+ *          （important、リンク先そのもの）」で扱いが違うかどうかを切り分ける
+ *   ・F・Gの結果次第で次の一手が変わる：
+ *       - Fも400 → jds.or.jpドメイン全体がGASからのアクセスを拒否している
+ *         （GASのIPレンジ自体がブロック対象。ヘッダーでは解決不可能）
+ *       - Fは200・Gも400 → important_list・important配下のモジュール（お知らせ関連）
+ *         だけを狙い撃ちでガードしている可能性（bot対策強化が該当箇所だけに入った等）
+ *       - Fも200・Gも200・現行のURLだけ400 → important_listの特定のクエリパラメータ
+ *         （content_id=1）や、そのページ固有の何かが引っかかっている可能性
+ *
+ * v3.7.2の変更点（JDS HTTP 400エラーの原因切り分け用デバッグ関数の追加）：
+ *   ・v3.7.1でUser-Agent・Accept-Languageヘッダーを追加したにもかかわらず、
+ *     日本糖尿病学会（jds_announcement）が依然としてHTTP 400を返す不具合が継続中。
+ *     一方、こちら側で同じURLに（GAS以外の経路で）アクセスしたところ普通にHTTP 200が
+ *     返り、ページ構成・リンクの形式（buildJdsAnnouncementLinkRegex_が想定する形）も
+ *     変わっていないことを確認した。つまりサイト自体は生きており、問題は
+ *     「GASからのアクセスだけが何らかの理由で弾かれている」可能性が高い。
+ *   ・HTTP 400（リクエスト自体が不正）という返り方は、403（明示的な拒否）とは違い、
+ *     「User-Agentはブラウザのふりをしているが、通信の“指紋”（TLSの握手など）は
+ *     Googleのサーバーそのもの」という矛盾をサイト側のセキュリティ装置（WAF）が
+ *     検知して弾く、というケースでよく見られるパターン。だとすると、v3.7.1で追加した
+ *     偽のChrome User-Agentは、直すどころか逆に「怪しさ」を増やした可能性がある。
+ *   ・原因を一発で切り分けるため、runDebugJdsFetchVariants（デバッグ用・一時的）を
+ *     セクションEに追加した。ヘッダーなし／UAのみ／現行（UA+Accept-Language）／
+ *     ブラウザに近いヘッダー一式／followRedirects:falseの5パターンを順番に試し、
+ *     それぞれのHTTPステータスをログに出す。シート（information_items等）には
+ *     一切書き込まないため、いつ実行しても安全。
+ *   ・実行結果（A〜Eそれぞれ何が返ったか）を次回フリちゃんから聞いて、
+ *     本番のfetchGakkaiAnnouncementSourceResult_をどう直すか決める：
+ *       - Aだけ200 → v3.7.1で追加したヘッダーが逆効果だった。ヘッダーを外す（v3.6以前に戻す）
+ *       - Dのみ200 → もっと本物のブラウザに近いヘッダー一式が必要。本番にAccept・Refererを追加
+ *       - 全滅（全部400） → GAS（Googleのサーバー）のIP・TLSの特徴自体がブロック対象に
+ *         入っている可能性が高く、ヘッダーだけでは解決できない。申し送りメモにあった
+ *         「原因不明のまま一旦保留する」判断が妥当（他7情報源には影響しないため実害は限定的）
+ *
+ * v3.7の不具合修正：
+ *   ・日本糖尿病学会のお知らせ取得が突然HTTP 400を返すようになった不具合を修正。
+ *     GASのUrlFetchAppはデフォルトでUser-Agentヘッダーを送らないため、これを見て
+ *     拒否するサイトがある。学会お知らせ共通の取得関数（fetchGakkaiAnnouncementSourceResult_、
+ *     日本内科学会・日本糖尿病学会で共用）に、ブラウザに近いUser-Agent・Accept-Language
+ *     ヘッダーを追加した。
+ *
+ * v3.6からの変更点（日医工お知らせボットの追加）：
+ *   ・日医工の医療関係者向けサイト（www.nichiiko.co.jp）の年別お知らせ一覧
+ *     （nichiiko_announcement）を新しい情報源として追加。他の情報源と同様、独立した
+ *     sourceIdで成功/失敗・変更検知を行うため、1情報源の取得失敗が他情報源に影響しない
+ *   ・沢井製薬と同様、会員登録・ログイン不要（確認済み）で一覧がそのままHTMLで取得できる
+ *   ・お知らせ一覧のURLは年ごとに変わる（whatsnew/{年}/index.php）ため、日付から
+ *     当年・前年のURLを自動算出する（厚労省報道発表の月計算と同じ考え方）
+ *   ・このページは新発売・使用上の注意改訂・休業案内等も含めたあらゆるお知らせが
+ *     混ざった一覧のため、タイトルに「限定出荷」「出荷停止」「出荷再開」「出荷調整」
+ *     「自主回収」「供給状況」「供給停止」「供給再開」のいずれかを含むものだけを
+ *     対象にする（フリちゃんと合意済み）
+ *   ・タイトルに「回収」を含むものはitemTypeを「回収」、それ以外は「供給」にする
+ *     （PMDA・厚労省供給・沢井製薬と同じitemTypeを再利用）
+ *   ・日付とタイトルへのリンクが別要素になっているページのため、学会お知らせ・
+ *     厚労省報道発表と共通の抽出関数（extractDatedAnnouncementEntries_）を再利用している
+ *   詳細はgas/README.mdの「v3.6→v3.7の変更点」を参照。
+ *
+ * v3.5からの変更点（沢井製薬お知らせボットの追加）：
+ *   ・沢井製薬の医療関係者向けサイト（med.sawai.co.jp）トップページに掲載される
+ *     お知らせ一覧（sawai_announcement）を新しい情報源として追加。他の情報源と同様、
+ *     独立したsourceIdで成功/失敗・変更検知を行うため、1情報源の取得失敗が
+ *     他情報源に影響しない
+ *   ・沢井製薬のサイトは会員登録・ログインが不要（確認済み）で、お知らせ一覧が
+ *     そのままHTMLで取得できる。一方、東和薬品側は職種選択画面（Cookieベースの
+ *     簡易な確認画面）が挟まり同じ方式では取得できなかったため、今回は沢井製薬のみ対応
+ *   ・お知らせのうち「供給関連」カテゴリと、回収情報セクション（カテゴリラベルが無く
+ *     タイトルに「回収」を含むもの）だけを対象にする（フリちゃんと合意済み）。
+ *     「安全性・適正使用関連」「電子添文改訂」「包装変更」「その他」は対象外
+ *   ・itemTypeは回収情報セクション由来なら「回収」、それ以外（供給関連）なら「供給」に
+ *     する（PMDA・厚労省供給と同じitemTypeを再利用）。カテゴリはpharmacy、重要度は
+ *     一律info（参考）からスタートし、人間が個別に確認・重要度確定する運用
+ *   ・同じitemTypeを複数の情報源が使うようになったため、doGetのリンクラベル決定
+ *     （linkLabelForItemType_）にsourceIdも渡すよう拡張した
+ *   詳細はgas/README.mdの「v3.5→v3.6の変更点」を参照。
+ *
  * v3.4からの変更点（薬機法等の法的関連情報ボットの追加）：
  *   ・厚生労働省「報道発表資料」月別一覧（mhlw_houdou）を新しい情報源として追加。
  *     他の情報源と同様、独立したsourceIdで成功/失敗・変更検知を行うため、
@@ -877,13 +1009,18 @@ function buildMindsIncomingItems_(entries, listPageUrl, fetchedAtIso) {
 // ---- 学会お知らせ（日本内科学会・日本糖尿病学会）：HTML解析（GAS API非依存の純粋関数） ----
 
 /**
- * 文字列の中から最初に見つかった日本語の日付（"YYYY年M月D日"）をISO形式（"YYYY-MM-DD"）に
- * 変換して返す（純粋関数）。見つからなければ空文字を返す。
+ * 文字列の中から最初に見つかった日付をISO形式（"YYYY-MM-DD"）に変換して返す（純粋関数）。
+ * 「YYYY年M月D日」（漢字区切り）と「YYYY/M/D」（スラッシュ区切り、日医工等で使用）の
+ * どちらの形式にも対応する。見つからなければ空文字を返す。
  * parseMindsNewsEntryText_と似ているが、あちらは「日付+カテゴリ+タイトル」がまとまった
  * 1つの文字列からの分離用、こちらは任意の文字列から日付だけを拾う汎用版。
  */
 function findJapaneseDateAsIso_(text) {
-  var m = String(text || '').match(/(\d{4})年(\d{1,2})月(\d{1,2})日/);
+  var s = String(text || '');
+  var m = s.match(/(\d{4})年(\d{1,2})月(\d{1,2})日/);
+  if (!m) {
+    m = s.match(/(\d{4})\/(\d{1,2})\/(\d{1,2})/);
+  }
   if (!m) return '';
   var y = m[1];
   var mo = ('0' + m[2]).slice(-2);
@@ -948,7 +1085,7 @@ function extractDatedAnnouncementEntries_(html, linkRegex) {
 
     var searchStart = Math.max(0, match.index - DATE_LOOKBACK_CHARS);
     var precedingText = html.slice(searchStart, match.index);
-    var dateMatches = precedingText.match(/\d{4}年\d{1,2}月\d{1,2}日/g);
+    var dateMatches = precedingText.match(/\d{4}(?:年\d{1,2}月\d{1,2}日|\/\d{1,2}\/\d{1,2})/g);
     var publishedAt = dateMatches && dateMatches.length > 0 ? findJapaneseDateAsIso_(dateMatches[dateMatches.length - 1]) : '';
 
     entries.push({ id: id, url: url, title: title, publishedAt: publishedAt });
@@ -1079,9 +1216,52 @@ function isLegalRelatedAnnouncementTitle_(title) {
   return false;
 }
 
-/** 厚労省報道発表資料（/stf/newpage_{数字}.html）の詳細リンクにマッチする正規表現を作る。 */
-function buildMhlwHoudouLinkRegex_() {
-  return /<a\b[^>]*href="(https:\/\/www\.mhlw\.go\.jp\/stf\/newpage_(\d+)\.html)"[^>]*>([\s\S]*?)<\/a>/gi;
+/**
+ * 厚労省報道発表資料一覧のHTMLから、日付付きの発表エントリを抽出する（純粋関数）。
+ *
+ * このページは実際に見ると、リンクのURLパターンが単一ではなく混在している
+ * （`/stf/newpage_XXXXX.html`、`/stf/houdou/XXXXX_XXXXX.html`、`/toukei/...`等）ため、
+ * 単一パターンでのURL一致では大半を拾い落としてしまう（v3.5初回実装で実際に0件になった
+ * 不具合）。また多くのリンクがドメイン省略の相対URL（`href="/stf/..."`）だった。
+ *
+ * そこで方針を変更し、`/stf/`または`/toukei/`配下への`.html`リンク（絶対・相対どちらも許容）
+ * を広く対象にしつつ、**リンクの直前近く（3000文字以内）に日付がある場合だけ**を
+ * 発表エントリとして採用する。1日あたり10件を超える発表がある日もあるため、ウィンドウは
+ * 広めに取っている。ページ上部の巨大なメニュー・パンくずリンクは、日付テキストから
+ * 数千文字以上離れた場所にあるため、このウィンドウ幅でも実用上問題なく除外できる
+ * （仮に紛れ込んでも、事務的なメニュー文言はMHLW_LEGAL_KEYWORDS_に一致しないことが多く、
+ * 後段のキーワード絞り込みが二重の安全弁になる）。
+ * リンクのパス自体（`/`を`_`に置き換えたもの）を一意なidとして使う
+ * （URLパターンが混在しており、末尾の数字だけでは一意性を保証できないため）。
+ */
+function extractMhlwHoudouEntries_(html) {
+  var entries = [];
+  var seen = {};
+  var pattern = /<a\b[^>]*href="((?:https:\/\/www\.mhlw\.go\.jp)?(\/(?:stf|toukei)\/[^"?#]+\.html))"[^>]*>([\s\S]*?)<\/a>/gi;
+  var match;
+  var DATE_LOOKBACK_CHARS = 3000;
+
+  while ((match = pattern.exec(html)) !== null) {
+    var hrefValue = match[1];
+    var path = match[2];
+    var id = path.replace(/^\//, '').replace(/\//g, '_').replace(/\.html$/, '');
+    if (seen[id]) continue;
+
+    var searchStart = Math.max(0, match.index - DATE_LOOKBACK_CHARS);
+    var precedingText = html.slice(searchStart, match.index);
+    var dateMatches = precedingText.match(/\d{4}年\d{1,2}月\d{1,2}日/g);
+    if (!dateMatches || dateMatches.length === 0) continue; // 直前に日付が無い＝メニュー等とみなして除外
+
+    var title = stripHtmlTags_(match[3]).replace(/\s+/g, ' ').trim();
+    if (!title) continue;
+
+    seen[id] = true;
+    var publishedAt = findJapaneseDateAsIso_(dateMatches[dateMatches.length - 1]);
+    var url = hrefValue.indexOf('http') === 0 ? hrefValue : 'https://www.mhlw.go.jp' + hrefValue;
+    entries.push({ id: id, url: url, title: title, publishedAt: publishedAt });
+  }
+
+  return entries;
 }
 
 /** 厚労省報道発表のうち、内容変更判定に使うフィールドを決まった順序の配列にする。 */
@@ -1130,6 +1310,227 @@ function buildMhlwHoudouIncomingItems_(entries, fetchedAtIso) {
     })
     .map(function (entry) {
       return buildMhlwHoudouItem_(entry, fetchedAtIso);
+    });
+}
+
+// ---- 沢井製薬お知らせ（供給関連・回収情報）：HTML解析（GAS API非依存の純粋関数） ----
+
+/**
+ * 沢井製薬お知らせ一覧のカテゴリラベル一覧（お知らせ本文の先頭、日付の直後に現れる）。
+ * 回収情報セクションのお知らせにはこのラベルが付かない（parseSawaiAnnouncementText_参照）。
+ */
+var SAWAI_ANNOUNCEMENT_CATEGORIES_ = ['安全性・適正使用関連', '供給関連', '電子添文改訂', '包装変更', 'その他'];
+
+/**
+ * 沢井製薬お知らせ一覧のリンクテキスト
+ * （例："2026/09/14供給関連PDFNEW アレンドロン酸錠35mg「サワイ」の供給に関するお詫びとお願いPDFNEW"）
+ * から、日付・カテゴリ・タイトルを分離する（純粋関数）。Mindsと同様、日付・カテゴリ・タイトルが
+ * 1つのリンクの中にまとまっている。日付の直後にカテゴリラベルが無い場合は、回収情報セクションの
+ * お知らせとみなす（category: ''を返す）。前後に付く「PDF」「NEW」の装飾タグは取り除く。
+ */
+function parseSawaiAnnouncementText_(rawText) {
+  var text = String(rawText || '').replace(/\s+/g, ' ').trim();
+  var dateMatch = text.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})/);
+  var publishedAt = '';
+  var rest = text;
+
+  if (dateMatch) {
+    var y = dateMatch[1];
+    var m = ('0' + dateMatch[2]).slice(-2);
+    var d = ('0' + dateMatch[3]).slice(-2);
+    publishedAt = y + '-' + m + '-' + d;
+    rest = text.slice(dateMatch[0].length);
+  }
+
+  var category = '';
+  for (var i = 0; i < SAWAI_ANNOUNCEMENT_CATEGORIES_.length; i++) {
+    if (rest.indexOf(SAWAI_ANNOUNCEMENT_CATEGORIES_[i]) === 0) {
+      category = SAWAI_ANNOUNCEMENT_CATEGORIES_[i];
+      rest = rest.slice(category.length);
+      break;
+    }
+  }
+
+  rest = rest.replace(/^(PDF|NEW)+/i, '').replace(/(PDF|NEW)+$/i, '').trim();
+
+  return { publishedAt: publishedAt, category: category, title: rest };
+}
+
+/**
+ * カテゴリが「供給関連」、またはカテゴリが空でタイトルに「回収」を含む（＝回収情報セクション）
+ * ものだけを対象にする（フリちゃんと合意済み）。
+ */
+function isSawaiSupplyOrRecallAnnouncement_(parsed) {
+  if (!parsed) return false;
+  if (parsed.category === '供給関連') return true;
+  if (!parsed.category && typeof parsed.title === 'string' && parsed.title.indexOf('回収') !== -1) return true;
+  return false;
+}
+
+/**
+ * 沢井製薬お知らせ・回収情報の詳細PDFへのリンクにマッチする正規表現を作る。
+ * ナビゲーションメニュー等の大量のリンク（/product/や/topics/等）を誤って拾わないよう、
+ * 個別のお知らせPDFが置かれる/file/配下（絶対・相対どちらも許容）だけに絞っている。
+ */
+function buildSawaiAnnouncementLinkRegex_() {
+  return /<a\b[^>]*href="((?:https:\/\/med\.sawai\.co\.jp)?(\/file\/[^"?#]+))"[^>]*>([\s\S]*?)<\/a>/gi;
+}
+
+/**
+ * 沢井製薬お知らせ一覧の生HTMLから、お知らせ1件ずつの{id, url, publishedAt, category, title}を
+ * 抜き出す（純粋関数）。同じidへの重複リンクは最初に見つかったものだけを採用する。
+ */
+function extractSawaiAnnouncementEntries_(html) {
+  var entries = [];
+  var seen = {};
+  var pattern = buildSawaiAnnouncementLinkRegex_();
+  var match;
+
+  while ((match = pattern.exec(html)) !== null) {
+    var hrefValue = match[1];
+    var path = match[2];
+    var id = path
+      .replace(/^\//, '')
+      .replace(/\//g, '_')
+      .replace(/\.[a-zA-Z0-9]+$/, '');
+    if (seen[id]) continue;
+    seen[id] = true;
+
+    var parsed = parseSawaiAnnouncementText_(stripHtmlTags_(match[3]));
+    var url = hrefValue.indexOf('http') === 0 ? hrefValue : 'https://med.sawai.co.jp' + hrefValue;
+
+    entries.push({ id: id, url: url, publishedAt: parsed.publishedAt, category: parsed.category, title: parsed.title });
+  }
+
+  return entries;
+}
+
+/** 沢井製薬お知らせのうち、内容変更判定に使うフィールドを決まった順序の配列にする。 */
+function sawaiAnnouncementHashFields_(f) {
+  return [f.id, f.publishedAt, f.title];
+}
+
+/**
+ * 1件の沢井製薬お知らせエントリを、information_items用の「今回取得した内容」オブジェクトへ
+ * 変換する（純粋関数）。回収情報セクション由来（category空）はitemTypeを'回収'、それ以外
+ * （供給関連）は'供給'にする（既存のPMDA・厚労省供給と同じitemTypeを再利用）。
+ * 重要度は一律'info'（参考）からスタートし、人間が個別に確認・重要度確定する運用。
+ */
+function buildSawaiAnnouncementItem_(entry, fetchedAtIso) {
+  var contentHash = computeContentHash_(
+    sawaiAnnouncementHashFields_({ id: entry.id, publishedAt: entry.publishedAt, title: entry.title }),
+  );
+  var isRecall = !entry.category;
+
+  return {
+    id: 'sawai_announcement_' + entry.id,
+    sourceRecordId: entry.id,
+    category: 'pharmacy',
+    itemType: isRecall ? '回収' : '供給',
+    title: sanitizeCellValue_(entry.title),
+    summary: sanitizeCellValue_(entry.title),
+    aiImportance: 'info',
+    publishedAt: entry.publishedAt,
+    sourceName: sanitizeCellValue_('沢井製薬（' + (isRecall ? '回収情報' : entry.category) + '）'),
+    documentNumber: null,
+    pharmacyImpact: '',
+    requiredAction: null,
+    primaryUrl: entry.url,
+    remarks: '',
+    contentHash: contentHash,
+    fetchedAtIso: fetchedAtIso,
+  };
+}
+
+/**
+ * お知らせ一覧の全エントリから、供給関連・回収情報のものだけをinformation_items用
+ * オブジェクトの配列に変換する（純粋関数）。
+ */
+function buildSawaiIncomingItems_(entries, fetchedAtIso) {
+  return entries
+    .filter(function (entry) {
+      return isSawaiSupplyOrRecallAnnouncement_({ category: entry.category, title: entry.title });
+    })
+    .map(function (entry) {
+      return buildSawaiAnnouncementItem_(entry, fetchedAtIso);
+    });
+}
+
+// ---- 日医工お知らせ（供給関連・回収情報）：HTML解析（GAS API非依存の純粋関数） ----
+
+/**
+ * 日医工お知らせ一覧のうち、「供給関連・回収情報」と判定するためのキーワード一覧
+ * （フリちゃんと合意済み）。このページは新発売・使用上の注意改訂・休業案内等も含めた
+ * あらゆるお知らせが混ざった一覧のため、絞り込みが必須。
+ */
+var NICHIIKO_WHATSNEW_KEYWORDS_ = ['限定出荷', '出荷停止', '出荷再開', '出荷調整', '自主回収', '供給状況', '供給停止', '供給再開'];
+
+/** タイトルが上記キーワードのいずれかを含むかどうか。 */
+function isNichiikoSupplyOrRecallTitle_(title) {
+  if (typeof title !== 'string') return false;
+  for (var i = 0; i < NICHIIKO_WHATSNEW_KEYWORDS_.length; i++) {
+    if (title.indexOf(NICHIIKO_WHATSNEW_KEYWORDS_[i]) !== -1) return true;
+  }
+  return false;
+}
+
+/**
+ * 日医工お知らせ一覧（年別ページ）の詳細PDFへのリンクにマッチする正規表現を作る。
+ * ナビゲーションメニュー等の大量のリンク（/medicine/expiration等）を誤って拾わないよう、
+ * 個別のお知らせPDFが置かれる/medicine/files/配下（絶対・相対どちらも許容）だけに絞っている。
+ */
+function buildNichiikoAnnouncementLinkRegex_() {
+  return /<a\b[^>]*href="((?:https:\/\/www\.nichiiko\.co\.jp)?(\/medicine\/files\/[^"?#]+))"[^>]*>([\s\S]*?)<\/a>/gi;
+}
+
+/** 日医工お知らせのうち、内容変更判定に使うフィールドを決まった順序の配列にする。 */
+function nichiikoAnnouncementHashFields_(f) {
+  return [f.id, f.publishedAt, f.title];
+}
+
+/**
+ * 1件の日医工お知らせエントリを、information_items用の「今回取得した内容」オブジェクトへ
+ * 変換する（純粋関数）。タイトルに「回収」を含むものはitemTypeを'回収'、それ以外は'供給'に
+ * する（PMDA・厚労省供給・沢井製薬と同じitemTypeを再利用）。重要度は一律'info'（参考）から
+ * スタートし、人間が個別に確認・重要度確定する運用。
+ */
+function buildNichiikoAnnouncementItem_(entry, fetchedAtIso) {
+  var contentHash = computeContentHash_(
+    nichiikoAnnouncementHashFields_({ id: entry.id, publishedAt: entry.publishedAt, title: entry.title }),
+  );
+  var isRecall = typeof entry.title === 'string' && entry.title.indexOf('回収') !== -1;
+
+  return {
+    id: 'nichiiko_announcement_' + entry.id,
+    sourceRecordId: entry.id,
+    category: 'pharmacy',
+    itemType: isRecall ? '回収' : '供給',
+    title: sanitizeCellValue_(entry.title),
+    summary: sanitizeCellValue_(entry.title),
+    aiImportance: 'info',
+    publishedAt: entry.publishedAt,
+    sourceName: '日医工（お知らせ）',
+    documentNumber: null,
+    pharmacyImpact: '',
+    requiredAction: null,
+    primaryUrl: entry.url,
+    remarks: '',
+    contentHash: contentHash,
+    fetchedAtIso: fetchedAtIso,
+  };
+}
+
+/**
+ * お知らせ一覧の全エントリから、NICHIIKO_WHATSNEW_KEYWORDS_のいずれかをタイトルに含む
+ * ものだけをinformation_items用オブジェクトの配列に変換する（純粋関数）。
+ */
+function buildNichiikoIncomingItems_(entries, fetchedAtIso) {
+  return entries
+    .filter(function (entry) {
+      return isNichiikoSupplyOrRecallTitle_(entry.title);
+    })
+    .map(function (entry) {
+      return buildNichiikoAnnouncementItem_(entry, fetchedAtIso);
     });
 }
 
@@ -1397,8 +1798,14 @@ function applyFetchResultsToState_(existingById, fetchResults, nowIso) {
   return { updatedById: updatedById, historyEntries: historyEntries, runLogs: runLogs };
 }
 
-/** itemType（'回収' / '供給' / 'ガイドライン' / '治療情報' / '行政通知' 等）から、リンクの見出しに使うラベルを決める。 */
-function linkLabelForItemType_(itemType) {
+/**
+ * itemType（'回収' / '供給' / 'ガイドライン' / '治療情報' / '行政通知' 等）から、リンクの見出しに
+ * 使うラベルを決める。sourceIdを渡すと、同じitemTypeを複数の情報源が使うケース
+ * （'回収'＝PMDAと沢井製薬、'供給'＝厚労省と沢井製薬）を区別できる。
+ */
+function linkLabelForItemType_(itemType, sourceId) {
+  if (sourceId === 'sawai_announcement') return '沢井製薬 お知らせ（原文）';
+  if (sourceId === 'nichiiko_announcement') return '日医工 お知らせ（原文）';
   if (itemType === '供給') return '厚労省 医療用医薬品供給状況（Excel原本）';
   if (itemType === 'ガイドライン') return 'Minds お知らせページ（原文）';
   if (itemType === '治療情報') return '学会お知らせページ（原文）';
@@ -1492,6 +1899,8 @@ var SOURCE_LABELS_ = {
   naika_announcement: '日本内科学会お知らせ',
   jds_announcement: '日本糖尿病学会お知らせ',
   mhlw_houdou: '厚労省報道発表（薬機法等）',
+  sawai_announcement: '沢井製薬お知らせ',
+  nichiiko_announcement: '日医工お知らせ',
 };
 
 // 旧バージョン（v2）が使っていた「情報アイテム変換結果」シート関連
@@ -2126,11 +2535,22 @@ var JDS_ANNOUNCEMENT_LIST_URL = 'https://www.jds.or.jp/modules/important_list/in
  * 成功/失敗を記録するため、1情報源の取得失敗・ページ構成変更が他情報源に影響しない。
  * maxCountで取得件数の上限を切る（日本糖尿病学会のお知らせ一覧は過去分まで1ページに
  * まとまって表示されるため、初回実行で大量の古いお知らせを取り込みすぎないようにする）。
+ * ブラウザに近いUser-Agent等のヘッダーを付けている：User-Agentが無いリクエストを
+ * 一部のサイトが拒否する（HTTP 400/403等）ことがあるための対策（v3.7で日本糖尿病学会側が
+ * 突然HTTP 400を返すようになった不具合の修正）。
  */
 function fetchGakkaiAnnouncementSourceResult_(sourceId, sourceLabel, listUrl, linkRegex, maxCount) {
   var startedAt = new Date().toISOString();
   try {
-    var response = UrlFetchApp.fetch(listUrl, { muteHttpExceptions: true, followRedirects: true });
+    var response = UrlFetchApp.fetch(listUrl, {
+      muteHttpExceptions: true,
+      followRedirects: true,
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+      },
+    });
     var code = response.getResponseCode();
     if (code !== 200) {
       return {
@@ -2231,7 +2651,7 @@ function fetchMhlwHoudouSourceResult_() {
     };
   }
 
-  var entries = extractDatedAnnouncementEntries_(html, buildMhlwHoudouLinkRegex_());
+  var entries = extractMhlwHoudouEntries_(html);
   if (entries.length === 0) {
     Logger.log('厚労省報道発表一覧からリンクを1件も抽出できませんでした。ページ構成が変わった可能性があります。');
   }
@@ -2240,6 +2660,121 @@ function fetchMhlwHoudouSourceResult_() {
   var items = buildMhlwHoudouIncomingItems_(entries, fetchedAtIso);
 
   return { sourceId: 'mhlw_houdou', success: true, items: items, fetchedAt: fetchedAtIso, startedAt: startedAt, error: null };
+}
+
+// ---- 沢井製薬お知らせ（供給関連・回収情報）：ネットワーク取得（GAS依存） ----
+
+var SAWAI_ANNOUNCEMENT_LIST_URL = 'https://med.sawai.co.jp/';
+
+/**
+ * 沢井製薬お知らせ一覧（トップページに掲載される直近の一覧）を取得し、
+ * { sourceId, success, items, fetchedAt, error } の形で返す。他の情報源と同様、独立した
+ * sourceIdとして成功/失敗を記録するため、この情報源の取得失敗・ページ構成変更が
+ * 他情報源に影響しない。このページは会員登録・ログイン不要（確認済み。東和薬品側は
+ * 職種選択画面が挟まり同じ方式では取得できなかったため、今回は沢井製薬のみ対応）。
+ */
+function fetchSawaiAnnouncementSourceResult_() {
+  var startedAt = new Date().toISOString();
+  try {
+    var response = UrlFetchApp.fetch(SAWAI_ANNOUNCEMENT_LIST_URL, { muteHttpExceptions: true, followRedirects: true });
+    var code = response.getResponseCode();
+    if (code !== 200) {
+      return {
+        sourceId: 'sawai_announcement',
+        success: false,
+        items: [],
+        fetchedAt: new Date().toISOString(),
+        startedAt: startedAt,
+        error: '沢井製薬お知らせ一覧の取得に失敗しました（HTTP ' + code + '）',
+      };
+    }
+
+    var html = response.getContentText('UTF-8');
+    var entries = extractSawaiAnnouncementEntries_(html);
+    if (entries.length === 0) {
+      Logger.log('沢井製薬お知らせ一覧からリンクを1件も抽出できませんでした。ページ構成が変わった可能性があります。');
+    }
+
+    var fetchedAtIso = new Date().toISOString();
+    var items = buildSawaiIncomingItems_(entries, fetchedAtIso);
+
+    return { sourceId: 'sawai_announcement', success: true, items: items, fetchedAt: fetchedAtIso, startedAt: startedAt, error: null };
+  } catch (e) {
+    return {
+      sourceId: 'sawai_announcement',
+      success: false,
+      items: [],
+      fetchedAt: new Date().toISOString(),
+      startedAt: startedAt,
+      error: '沢井製薬お知らせ取得・解析中にエラー: ' + e,
+    };
+  }
+}
+
+// ---- 日医工お知らせ（供給関連・回収情報）：ネットワーク取得（GAS依存） ----
+
+var NICHIIKO_WHATSNEW_BASE_URL = 'https://www.nichiiko.co.jp/medicine/whatsnew/';
+
+/**
+ * 日医工お知らせ一覧のURLに使う年（西暦4桁の文字列）候補を、当年→前年の順で返す（純粋関数）。
+ * 年が変わった直後でまだ当年ページが無い場合に備えて、前年もフォールバック候補にする
+ * （PMDA・厚労省報道発表と同じ考え方）。日本時間で年を算出する。
+ */
+function nichiikoWhatsNewYearCandidates_(date) {
+  var d = date || new Date();
+  var jst = new Date(d.getTime() + 9 * 60 * 60 * 1000);
+  var year = jst.getUTCFullYear();
+  return [String(year), String(year - 1)];
+}
+
+/**
+ * 日医工お知らせ一覧（年別ページ）を取得し、{ sourceId, success, items, fetchedAt, error }
+ * の形で返す。他の情報源と同様、独立したsourceIdとして成功/失敗を記録するため、
+ * この情報源の取得失敗・ページ構成変更が他情報源に影響しない。このページは会員登録・
+ * ログイン不要（確認済み。ページ下部に「あなたは医療関係者の方ですか？」という確認画面が
+ * あるが、これは表示上のものでコンテンツ自体は取得できる）。
+ */
+function fetchNichiikoAnnouncementSourceResult_() {
+  var startedAt = new Date().toISOString();
+  var candidates = nichiikoWhatsNewYearCandidates_(new Date());
+  var html = null;
+  var lastError = null;
+
+  for (var i = 0; i < candidates.length; i++) {
+    var url = NICHIIKO_WHATSNEW_BASE_URL + candidates[i] + '/index.php';
+    try {
+      var response = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true });
+      var code = response.getResponseCode();
+      if (code === 200) {
+        html = response.getContentText('UTF-8');
+        break;
+      }
+      lastError = url + ' の取得に失敗しました（HTTP ' + code + '）';
+    } catch (e) {
+      lastError = url + ' の取得中にエラー: ' + e;
+    }
+  }
+
+  if (html === null) {
+    return {
+      sourceId: 'nichiiko_announcement',
+      success: false,
+      items: [],
+      fetchedAt: new Date().toISOString(),
+      startedAt: startedAt,
+      error: lastError || '日医工お知らせ一覧の取得に失敗しました（当年・前年とも）',
+    };
+  }
+
+  var entries = extractDatedAnnouncementEntries_(html, buildNichiikoAnnouncementLinkRegex_());
+  if (entries.length === 0) {
+    Logger.log('日医工お知らせ一覧からリンクを1件も抽出できませんでした。ページ構成が変わった可能性があります。');
+  }
+
+  var fetchedAtIso = new Date().toISOString();
+  var items = buildNichiikoIncomingItems_(entries, fetchedAtIso);
+
+  return { sourceId: 'nichiiko_announcement', success: true, items: items, fetchedAt: fetchedAtIso, startedAt: startedAt, error: null };
 }
 
 // ---- 実行エントリーポイント ----
@@ -2266,8 +2801,15 @@ function runConvertAllToInformationItems() {
   var mhlwResult = fetchMhlwSupplySourceResult_(existingMhlwStates);
   var mindsResult = fetchMindsGuidelineSourceResult_();
   var naikaResult = fetchNaikaAnnouncementSourceResult_();
-  var jdsResult = fetchJdsAnnouncementSourceResult_();
+  // 日本糖尿病学会（jds_announcement）はv3.7.5より一旦保留中。
+  // お知らせモジュール（/modules/important/・/modules/important_list/）だけがGASからの
+  // アクセスを拒否しており、ヘッダー・Cookieのどちらをどう調整しても回避できなかったため
+  // （切り分けの詳細はファイル冒頭のv3.7.2〜v3.7.4のコメント参照）。再開する場合は
+  // 下のjdsResultの行と、concat内のjdsResultをコメントアウトから戻すこと。
+  // var jdsResult = fetchJdsAnnouncementSourceResult_();
   var mhlwHoudouResult = fetchMhlwHoudouSourceResult_();
+  var sawaiResult = fetchSawaiAnnouncementSourceResult_();
+  var nichiikoResult = fetchNichiikoAnnouncementSourceResult_();
 
   var lock = LockService.getScriptLock();
   var gotLock = false;
@@ -2289,7 +2831,7 @@ function runConvertAllToInformationItems() {
     var nowIso = new Date().toISOString();
     var applied = applyFetchResultsToState_(
       existingById,
-      pmdaResults.concat([mhlwResult, mindsResult, naikaResult, jdsResult, mhlwHoudouResult]),
+      pmdaResults.concat([mhlwResult, mindsResult, naikaResult, mhlwHoudouResult, sawaiResult, nichiikoResult]),
       nowIso,
     );
 
@@ -2310,10 +2852,13 @@ function runConvertAllToInformationItems() {
         (mindsResult.success ? '成功(' + mindsResult.items.length + '件)' : '失敗: ' + mindsResult.error) +
         ' / 日本内科学会: ' +
         (naikaResult.success ? '成功(' + naikaResult.items.length + '件)' : '失敗: ' + naikaResult.error) +
-        ' / 日本糖尿病学会: ' +
-        (jdsResult.success ? '成功(' + jdsResult.items.length + '件)' : '失敗: ' + jdsResult.error) +
+        ' / 日本糖尿病学会: 保留中（v3.7.5より取得停止、詳細はファイル冒頭コメント参照） ' +
         ' / 厚労省報道発表: ' +
-        (mhlwHoudouResult.success ? '成功(' + mhlwHoudouResult.items.length + '件)' : '失敗: ' + mhlwHoudouResult.error),
+        (mhlwHoudouResult.success ? '成功(' + mhlwHoudouResult.items.length + '件)' : '失敗: ' + mhlwHoudouResult.error) +
+        ' / 沢井製薬お知らせ: ' +
+        (sawaiResult.success ? '成功(' + sawaiResult.items.length + '件)' : '失敗: ' + sawaiResult.error) +
+        ' / 日医工お知らせ: ' +
+        (nichiikoResult.success ? '成功(' + nichiikoResult.items.length + '件)' : '失敗: ' + nichiikoResult.error),
     );
   } finally {
     lock.releaseLock();
@@ -2448,6 +2993,20 @@ function runConvertMhlwHoudouToInformationItems() {
   });
 }
 
+/** 沢井製薬お知らせ（供給関連・回収情報）だけを取得してマージする（動作確認用の単体実行）。 */
+function runConvertSawaiAnnouncementToInformationItems() {
+  runSingleSourceConversion_(function () {
+    return [fetchSawaiAnnouncementSourceResult_()];
+  });
+}
+
+/** 日医工お知らせ（供給関連・回収情報）だけを取得してマージする（動作確認用の単体実行）。 */
+function runConvertNichiikoAnnouncementToInformationItems() {
+  runSingleSourceConversion_(function () {
+    return [fetchNichiikoAnnouncementSourceResult_()];
+  });
+}
+
 /* ============================================================
  * セクションC：Web App化（doGet / doPost）
  * ============================================================ */
@@ -2537,7 +3096,7 @@ function doGet(e) {
       homeDisplayConfirmedBy: state.homeDisplayConfirmedBy,
       homeDisplayConfirmedAt: state.homeDisplayConfirmedAt,
       homeDisplayNeedsReview: state.homeDisplayNeedsReview,
-      links: state.primaryUrl ? [{ label: linkLabelForItemType_(state.itemType), url: state.primaryUrl, kind: 'primary' }] : [],
+      links: state.primaryUrl ? [{ label: linkLabelForItemType_(state.itemType, state.sourceId), url: state.primaryUrl, kind: 'primary' }] : [],
       fetchError: null,
     };
   });
@@ -2811,3 +3370,4 @@ function loadExistingRecallNumbers_(sheet) {
   }
   return keys;
 }
+
